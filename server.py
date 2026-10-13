@@ -17,7 +17,7 @@ STT_MODEL = "whisper-large-v3"
 MAX_HISTORY = 10                           # giữ 10 tin nhắn gần nhất
 
 TTS_VOICE = "vi-VN-HoaiMyNeural"           # giọng nữ tiếng Việt
-TTS_CHUNK = 4096                           # bytes mỗi gói gửi về ESP32 (~128 ms audio)
+TTS_CHUNK = 1024                           # bytes mỗi gói gửi về ESP32 (~32 ms audio)
 
 # Model chat theo thứ tự ưu tiên
 PREFERRED_LLM = [
@@ -111,10 +111,13 @@ async def text_to_speech_pcm(text: str) -> bytes:
 
 async def send_audio(ws: WebSocket, pcm: bytes):
     """Gửi audio theo nhịp thời lượng thực để ESP32 không bị tràn hàng đợi."""
+    sent = 0
     for i in range(0, len(pcm), TTS_CHUNK):
         chunk = pcm[i:i + TTS_CHUNK]
         await ws.send_bytes(chunk)
+        sent += len(chunk)
         await asyncio.sleep(len(chunk) / (SAMPLE_RATE * 2))
+    print(f"Đã gửi xong audio: {sent}/{len(pcm)} bytes", flush=True)
 
 
 @app.get("/")
