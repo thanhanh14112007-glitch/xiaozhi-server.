@@ -12,7 +12,7 @@ groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 SAMPLE_RATE = 16000
 MIN_BYTES = SAMPLE_RATE * 2 // 2          # tối thiểu 0.5 giây audio (16-bit mono)
 STT_MODEL = "whisper-large-v3"
-LLM_MODEL = "llama-3.1-8b-instant"
+LLM_MODEL = None                           # được chọn tự động khi cần
 MAX_HISTORY = 10                           # giữ 10 tin nhắn gần nhất (5 lượt hỏi đáp)
 
 SYSTEM_PROMPT = (
@@ -42,12 +42,32 @@ def speech_to_text(pcm: bytes) -> str:
     return result.text or ""
 
 
+def pick_llm_model() -> str:
+    global LLM_MODEL
+    if LLM_MODEL:
+        return LLM_MODEL
+
+    ids = [m.id for m in groq_client.models.list().data]
+    print("Model khả dụng:", ids, flush=True)
+
+    # Loại bỏ model không phải chat (speech, guard, tts, embedding)
+    skip = ("whisper", "guard", "tts", "embed", "distil")
+    chat = [i for i in ids if not any(s in i.lower() for s in skip)]
+    llama = [i for i in chat if "llama" in i.lower()]
+
+    LLM_MODEL = (llama or chat or [None])[0]
+    if not LLM_MODEL:
+        raise RuntimeError("Key Groq không có model chat nào khả dụng")
+    print("Chọn model:", LLM_MODEL, flush=True)
+    return LLM_MODEL
+
+
 def ask_llm(history: list, user_text: str) -> str:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages += history
     messages.append({"role": "user", "content": user_text})
     resp = groq_client.chat.completions.create(
-        model=LLM_MODEL,
+        model=pick_llm_model(),
         messages=messages,
         max_tokens=200,
         temperature=0.7,
