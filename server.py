@@ -4,14 +4,22 @@ import os
 import wave
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from google import genai
-from google.genai import types
+from groq import Groq
 
 app = FastAPI()
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 SAMPLE_RATE = 16000
-MIN_BYTES = SAMPLE_RATE * 2 // 2  # tối thiểu 0.5 giây audio (16-bit mono)
+MIN_BYTES = SAMPLE_RATE * 2 // 2          # tối thiểu 0.5 giây audio (16-bit mono)
+STT_MODEL = "whisper-large-v3"
+LLM_MODEL = "llama-3.3-70b-versatile"
+MAX_HISTORY = 10                           # giữ 10 tin nhắn gần nhất (5 lượt hỏi đáp)
+
+SYSTEM_PROMPT = (
+    "Bạn là trợ lý giọng nói chạy trên thiết bị ESP32. "
+    "Luôn trả lời bằng tiếng Việt, ngắn gọn, tối đa 2 đến 3 câu. "
+    "Không dùng markdown, emoji hay danh sách."
+)
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:
@@ -24,16 +32,27 @@ def pcm_to_wav(pcm: bytes) -> bytes:
     return buf.getvalue()
 
 
-def ask_gemini(pcm: bytes) -> str:
+def speech_to_text(pcm: bytes) -> str:
     wav = pcm_to_wav(pcm)
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[
-            types.Part.from_bytes(data=wav, mime_type="audio/wav"),
-            "Hãy nghe đoạn âm thanh này và trả lời ngắn gọn bằng tiếng Việt.",
-        ],
+    result = groq_client.audio.transcriptions.create(
+        file=("audio.wav", wav),
+        model=STT_MODEL,
+        language="vi",
     )
-    return response.text or ""
+    return result.text or ""
+
+
+def ask_llm(history: list, user_text: str) -> str:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages += history
+    messages.append({"role": "user", "content": user_text})
+    resp = groq_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        max_tokens=200,
+        temperature=0.7,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
 @app.get("/")
@@ -48,6 +67,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     audio_buffer = bytearray()
     recording = False
+    history: list = []
 
     try:
         while True:
@@ -79,9 +99,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_text("Âm thanh quá ngắn, hãy nói lâu hơn.")
                     continue
 
-                print(f"Nhận {len(pcm)} bytes, gửi Gemini", flush=True)
+                print(f"Nhận {len(pcm)} bytes, bắt đầu nhận dạng giọng nói", flush=True)
                 try:
-                    reply = await asyncio.to_thread(ask_gemini, pcm)
+                    user_text = await asyncio.to_thread(speech_to_text, pcm)
+                    print("Người dùng nói:", user_text, flush=True)
+
+                    if not user_text.strip():
+                        reply = "Mình không nghe rõ, bạn nói lại nhé."
+                    else:
+                        reply = await asyncio.to_thread(ask_llm, history, user_text)
+                        history.append({"role": "user", "content": user_text})
+                        history.append({"role": "assistant", "content": reply})
+                        del history[:-MAX_HISTORY]
                 except Exception as e:
                     reply = f"Lỗi: {e}"
                     print(reply, flush=True)
