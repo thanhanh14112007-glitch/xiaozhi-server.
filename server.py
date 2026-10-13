@@ -12,7 +12,7 @@ groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 SAMPLE_RATE = 16000
 MIN_BYTES = SAMPLE_RATE * 2 // 2          # tối thiểu 0.5 giây audio (16-bit mono)
 STT_MODEL = "whisper-large-v3"
-LLM_MODEL = "llama-3.3-70b-versatile"
+LLM_MODEL = "llama-3.1-8b-instant"
 MAX_HISTORY = 10                           # giữ 10 tin nhắn gần nhất (5 lượt hỏi đáp)
 
 SYSTEM_PROMPT = (
