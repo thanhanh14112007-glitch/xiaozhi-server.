@@ -3,6 +3,8 @@ import io
 import os
 import wave
 
+import edge_tts
+import miniaudio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from groq import Groq
 
@@ -12,16 +14,19 @@ groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 SAMPLE_RATE = 16000
 MIN_BYTES = SAMPLE_RATE * 2 // 2          # tối thiểu 0.5 giây audio (16-bit mono)
 STT_MODEL = "whisper-large-v3"
-MAX_HISTORY = 10                           # giữ 10 tin nhắn gần nhất (5 lượt hỏi đáp)
+MAX_HISTORY = 10                           # giữ 10 tin nhắn gần nhất
 
-# Model chat theo thứ tự ưu tiên. Server chỉ dùng model mà key có trong danh sách.
+TTS_VOICE = "vi-VN-HoaiMyNeural"           # giọng nữ tiếng Việt
+TTS_CHUNK = 4096                           # bytes mỗi gói gửi về ESP32 (~128 ms audio)
+
+# Model chat theo thứ tự ưu tiên
 PREFERRED_LLM = [
     "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
     "qwen/qwen3.8-27b",
     "allam-2-7b",
 ]
-LLM_CANDIDATES = None                      # cache danh sách model khả dụng
+LLM_CANDIDATES = None
 
 SYSTEM_PROMPT = (
     "Bạn là trợ lý giọng nói chạy trên thiết bị ESP32. "
@@ -85,6 +90,33 @@ def ask_llm(history: list, user_text: str) -> str:
     raise last_err
 
 
+async def text_to_speech_pcm(text: str) -> bytes:
+    """Đổi văn bản thành PCM 16-bit, mono, 16 kHz."""
+    communicate = edge_tts.Communicate(text, TTS_VOICE)
+    mp3 = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            mp3.extend(chunk["data"])
+    if not mp3:
+        raise RuntimeError("TTS không trả về audio")
+
+    decoded = miniaudio.decode(
+        bytes(mp3),
+        output_format=miniaudio.SampleFormat.SIGNED16,
+        nchannels=1,
+        sample_rate=SAMPLE_RATE,
+    )
+    return decoded.samples.tobytes()
+
+
+async def send_audio(ws: WebSocket, pcm: bytes):
+    """Gửi audio theo nhịp thời lượng thực để ESP32 không bị tràn hàng đợi."""
+    for i in range(0, len(pcm), TTS_CHUNK):
+        chunk = pcm[i:i + TTS_CHUNK]
+        await ws.send_bytes(chunk)
+        await asyncio.sleep(len(chunk) / (SAMPLE_RATE * 2))
+
+
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -130,6 +162,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 print(f"Nhận {len(pcm)} bytes, bắt đầu nhận dạng giọng nói", flush=True)
+                speak = False
                 try:
                     user_text = await asyncio.to_thread(speech_to_text, pcm)
                     print("Người dùng nói:", user_text, flush=True)
@@ -141,12 +174,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         history.append({"role": "user", "content": user_text})
                         history.append({"role": "assistant", "content": reply})
                         del history[:-MAX_HISTORY]
+                    speak = True
                 except Exception as e:
                     reply = f"Lỗi: {e}"
                     print(reply, flush=True)
 
                 print("Trả lời:", reply, flush=True)
                 await websocket.send_text(reply)
+
+                if speak:
+                    try:
+                        pcm_out = await text_to_speech_pcm(reply)
+                        print(f"TTS: {len(pcm_out)} bytes, đang phát", flush=True)
+                        await send_audio(websocket, pcm_out)
+                    except Exception as e:
+                        print("Lỗi TTS:", e, flush=True)
 
     except WebSocketDisconnect:
         pass
