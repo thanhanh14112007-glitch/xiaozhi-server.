@@ -2,3 +2,5 @@ fastapi
 uvicorn
 groq
 websockets
+edge-tts
+miniaudio
