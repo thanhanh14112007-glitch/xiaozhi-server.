@@ -887,4 +887,160 @@ async def run_button(data: str):
         await tg_text("Đã bật micro, bot đang nghe bạn." if ok else OFFLINE_MSG, MENU_KEYBOARD)
     elif data == "stop":
         ok = await send_device("CMD:STOP")
-        await tg_text("Đã dừng micro." if ok else OFFLINE_MSG,
+        await tg_text("Đã dừng micro." if ok else OFFLINE_MSG, MENU_KEYBOARD)
+    elif data == "status":
+        await tg_text(status_text(), MENU_KEYBOARD)
+    elif data == "list":
+        try:
+            await tg_text("Lịch: " + await asyncio.to_thread(tool_list_schedules, {}), MENU_KEYBOARD)
+        except Exception as e:
+            await tg_text(f"Không đọc được lịch: {e}", MENU_KEYBOARD)
+    elif data == "bye":
+        ws = DEVICE["ws"]
+        if ws is not None:
+            await speak_and_end(ws, "Tạm biệt chủ nhân.")
+            await send_device("CMD:STANDBY")
+            await tg_text("Thiết bị đã chuyển về chế độ chờ.", MENU_KEYBOARD)
+        else:
+            await tg_text(OFFLINE_MSG, MENU_KEYBOARD)
+    elif data == "leave_off":
+        cancel_leave()
+        ok = await send_device("CMD:DEV_OFF")
+        await tg_text("Đã tắt thiết bị." if ok else OFFLINE_MSG)
+    elif data == "leave_keep":
+        cancel_leave()
+        await tg_text("Đã giữ thiết bị bật.")
+
+
+async def handle_telegram_update(update: dict):
+    print("Nhận update Telegram, keys:", list(update.keys()), flush=True)
+
+    if "callback_query" in update:
+        cq = update["callback_query"]
+        chat = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+        print(f"Callback từ chat {chat}, cấu hình {TELEGRAM_CHAT_ID}", flush=True)
+        if chat != TELEGRAM_CHAT_ID:
+            print("Bỏ qua callback: chat ID không khớp", flush=True)
+            return
+        await asyncio.to_thread(tg_api, "answerCallbackQuery", {"callback_query_id": cq["id"]})
+        await run_button(cq.get("data", ""))
+        return
+
+    msg = update.get("message") or update.get("edited_message")
+    if not msg:
+        print("Update không có message, bỏ qua", flush=True)
+        return
+
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    print(f"Tin từ chat {chat_id}, cấu hình {TELEGRAM_CHAT_ID}", flush=True)
+    if chat_id != TELEGRAM_CHAT_ID:
+        print("Bỏ qua tin: chat ID không khớp", flush=True)
+        return
+
+    loc = msg.get("location")
+    if loc:
+        await on_location(loc["latitude"], loc["longitude"])
+        return
+
+    text = (msg.get("text") or "").strip()
+    print("Nội dung:", text, flush=True)
+    if not text:
+        return
+    if text.lower() in ("/start", "/menu", "menu"):
+        await tg_text("Chọn thao tác cho bot:", MENU_KEYBOARD)
+        return
+    await answer(text, voice=False)
+
+
+async def safe_handle(update: dict):
+    try:
+        await handle_telegram_update(update)
+    except Exception as e:
+        print("Lỗi xử lý Telegram:", e, flush=True)
+
+
+@app.post("/telegram/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if not TELEGRAM_WEBHOOK_SECRET or secret != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404)
+    update = await request.json()
+    asyncio.create_task(safe_handle(update))
+    return {"ok": True}
+
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+
+# ---------- WebSocket với ESP32 ----------
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    DEVICE["ws"] = websocket
+    print("ESP32 đã kết nối", flush=True)
+    await websocket.send_text(f"VOL:{STATE['volume']}")
+
+    audio_buffer = bytearray()
+    recording = False
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+
+            if message.get("bytes") is not None:
+                if recording:
+                    audio_buffer.extend(message["bytes"])
+                continue
+
+            text = message.get("text")
+            if text is None:
+                continue
+            print("TEXT:", text, flush=True)
+
+            if text == "START_RECORDING":
+                audio_buffer.clear()
+                recording = True
+
+            elif text == "CANCEL_RECORDING":
+                recording = False
+                audio_buffer.clear()
+
+            elif text == "END_SESSION":
+                recording = False
+                audio_buffer.clear()
+                stop_music()
+                STATE["history"].clear()
+                STATE["recent"].clear()
+                print("Kết thúc hội thoại, xóa lịch sử", flush=True)
+
+            elif text.startswith("SETVOL:"):
+                try:
+                    STATE["volume"] = max(0, min(100, int(text[7:])))
+                except ValueError:
+                    pass
+
+            elif text.startswith("STATE:"):
+                STATE["device_on"] = (text == "STATE:ON")
+
+            elif text == "HELLO":
+                asyncio.create_task(welcome(websocket))
+
+            elif text == "STOP_RECORDING":
+                recording = False
+                pcm = bytes(audio_buffer)
+                audio_buffer.clear()
+                await handle_turn(websocket, pcm)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print("Lỗi kết nối:", e, flush=True)
+    finally:
+        stop_music()
+        if DEVICE["ws"] is websocket:
+            DEVICE["ws"] = None
+
+    print("ESP32 ngắt kết nối", flush=True)
