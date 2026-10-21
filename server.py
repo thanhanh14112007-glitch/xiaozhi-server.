@@ -1,36 +1,50 @@
 import asyncio
 import io
 import json
+import math
 import os
 import re
+import threading
 import urllib.parse
 import urllib.request
+import uuid
 import wave
 from array import array
-from datetime import datetime
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo
 
 import edge_tts
 import miniaudio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from groq import Groq
 
 app = FastAPI()
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")        # tùy chọn
-JAMENDO_CLIENT_ID = os.environ.get("JAMENDO_CLIENT_ID")  # tùy chọn
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+JAMENDO_CLIENT_ID = os.environ.get("JAMENDO_CLIENT_ID")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+HOME_LAT = float(os.environ.get("HOME_LAT", "0") or 0)
+HOME_LNG = float(os.environ.get("HOME_LNG", "0") or 0)
+HOME_RADIUS_M = float(os.environ.get("HOME_RADIUS_M", "500") or 500)
+WELCOME_MUSIC_URL = os.environ.get("WELCOME_MUSIC_URL", "")
 
 TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 SAMPLE_RATE = 16000
 MIN_BYTES = SAMPLE_RATE * 2 // 2
 STT_MODEL = "whisper-large-v3"
 MAX_HISTORY = 10
+LEAVE_TIMEOUT_S = 300
+SCHEDULE_KEY = "xiaozhi:schedules"
 
 TTS_VOICE = "vi-VN-HoaiMyNeural"
-TTS_CHUNK = 1024                       # bytes mỗi gói (~32 ms audio)
-TTS_PEAK = int(0.6 * 32767)            # mức đỉnh giọng nói, tránh rè
-MUSIC_PEAK = int(0.35 * 32767)         # nhạc nhỏ hơn giọng nói
+TTS_CHUNK = 1024
+TTS_PEAK = int(0.6 * 32767)
+MUSIC_PEAK = int(0.35 * 32767)
 DEFAULT_VOLUME = 70
 
 PREFERRED_LLM = [
@@ -41,24 +55,55 @@ PREFERRED_LLM = [
 ]
 LLM_CANDIDATES = None
 
-# Kho nhạc riêng: tên bài -> link mp3 trực tiếp (ưu tiên cao nhất)
 MY_SONGS = {
     # "xuân này con không về": "https://raw.githubusercontent.com/USER/REPO/main/music/xuan-nay-con-khong-ve.mp3",
 }
-
-# Internet Archive
 ARCHIVE_SEARCH_URL = "https://archive.org/advancedsearch.php"
-ARCHIVE_MIN_BYTES = 1 * 1024 * 1024    # bỏ file quá nhỏ (thường là đoạn trích)
-ARCHIVE_MAX_BYTES = 15 * 1024 * 1024   # bỏ file quá lớn
+ARCHIVE_MIN_BYTES = 1 * 1024 * 1024
+ARCHIVE_MAX_BYTES = 15 * 1024 * 1024
+
+# Trạng thái toàn hệ thống (một thiết bị)
+STATE = {
+    "volume": DEFAULT_VOLUME,
+    "recent": [],
+    "history": [],
+    "music_task": None,
+    "device_on": False,       # thiết bị đang bật (ESP32 báo lên)
+    "at_home": None,          # None: chưa rõ, True: ở nhà, False: ngoài nhà
+    "leave_pending": False,   # đang chờ người dùng trả lời có tắt thiết bị khi ra ngoài không
+    "leave_task": None,
+}
+DEVICE = {"ws": None}
+SCHED_LOCK = threading.Lock()
+
+MENU_KEYBOARD = {"inline_keyboard": [
+    [{"text": "Bật thiết bị", "callback_data": "dev_on"},
+     {"text": "Tắt thiết bị", "callback_data": "dev_off"}],
+    [{"text": "Bật micro", "callback_data": "start"},
+     {"text": "Dừng micro", "callback_data": "stop"}],
+    [{"text": "Trạng thái", "callback_data": "status"},
+     {"text": "Xem lịch", "callback_data": "list"}],
+    [{"text": "Tạm biệt (chờ)", "callback_data": "bye"}],
+]}
+LEAVE_KEYBOARD = {"inline_keyboard": [
+    [{"text": "Tắt thiết bị", "callback_data": "leave_off"},
+     {"text": "Giữ bật", "callback_data": "leave_keep"}],
+]}
 
 BASE_PROMPT = (
     "Bạn là trợ lý giọng nói chạy trên thiết bị ESP32, người dùng nghe câu trả lời qua loa. "
     "Luôn trả lời bằng tiếng Việt, tự nhiên, ngắn gọn, tối đa 3 câu. "
     "Không dùng markdown, emoji, danh sách hay đường link. "
-    "Bạn có các công cụ: xem giờ, tìm kiếm web, xem thời tiết, chỉnh âm lượng và phát nhạc. "
+    "Bạn có các công cụ: xem giờ, tìm kiếm web, xem thời tiết, chỉnh âm lượng, phát nhạc, "
+    "gửi tin nhắn Telegram, bật hoặc tắt thiết bị (đèn, quạt), đặt lịch hẹn, xem và hủy lịch, "
+    "và chuyển về chế độ chờ. "
+    "Khi người dùng nói bật hoặc tắt đèn, quạt hoặc thiết bị, gọi device_control. "
+    "Khi người dùng nói tạm biệt hoặc tắt bot, gọi shutdown_bot. "
+    "Khi người dùng đặt hẹn hoặc nhắc việc theo giờ, gọi add_schedule với when dạng HH:MM hoặc YYYY-MM-DD HH:MM theo giờ Việt Nam, "
+    "và xác nhận lại rõ thời gian. "
     "Khi cần thông tin mới (thời tiết, tin tức, giá cả, sự kiện) hãy gọi công cụ trước khi trả lời. "
     "Khi người dùng nhờ phát nhạc hoặc hát, gọi play_music. Bạn không tự hát được bài mới, chỉ phát được bản thu có sẵn. "
-    "Bạn chưa có quyền truy cập lịch cá nhân, email hay thiết bị khác; nếu được hỏi, hãy nói thật."
+    "Bạn chưa có quyền truy cập lịch Google, email hay thiết bị khác; nếu được hỏi, hãy nói thật."
 )
 
 
@@ -71,7 +116,15 @@ def normalize(s: str) -> str:
     return re.sub(r"[^\w\s]", "", s.lower()).strip()
 
 
-# ---------- Tiện ích mạng ----------
+def distance_m(lat1, lon1, lat2, lon2) -> float:
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
 def http_json(url: str, data=None, timeout: int = 10):
     body = json.dumps(data).encode("utf-8") if data is not None else None
     req = urllib.request.Request(url, data=body, headers={"User-Agent": "xiaozhi-bot/1.0"})
@@ -79,6 +132,76 @@ def http_json(url: str, data=None, timeout: int = 10):
         req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+# ---------- Upstash: lưu lịch bền vững ----------
+def redis_cmd(*args):
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        raise RuntimeError("Chưa cấu hình Upstash")
+    req = urllib.request.Request(
+        UPSTASH_URL,
+        data=json.dumps(list(args)).encode("utf-8"),
+        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    if "error" in data:
+        raise RuntimeError(data["error"])
+    return data.get("result")
+
+
+def load_schedules():
+    raw = redis_cmd("GET", SCHEDULE_KEY)
+    return json.loads(raw) if raw else []
+
+
+def save_schedules(items):
+    redis_cmd("SET", SCHEDULE_KEY, json.dumps(items, ensure_ascii=False))
+
+
+def sched_read():
+    with SCHED_LOCK:
+        return load_schedules()
+
+
+def sched_add(item):
+    with SCHED_LOCK:
+        items = load_schedules()
+        items.append(item)
+        save_schedules(items)
+
+
+def sched_remove(ids):
+    with SCHED_LOCK:
+        items = load_schedules()
+        save_schedules([i for i in items if i["id"] not in ids])
+
+
+def sched_cancel(sid: str) -> bool:
+    with SCHED_LOCK:
+        items = load_schedules()
+        new = [i for i in items if i["id"] != sid]
+        if len(new) == len(items):
+            return False
+        save_schedules(new)
+        return True
+
+
+def parse_when(s: str) -> datetime:
+    s = (s or "").strip()
+    now = datetime.now(TZ)
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})", s)
+    if m:
+        y, mo, d, h, mi = map(int, m.groups())
+        return datetime(y, mo, d, h, mi, tzinfo=TZ)
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
+    if m:
+        h, mi = map(int, m.groups())
+        t = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+        if t <= now:
+            t += timedelta(days=1)
+        return t
+    raise ValueError("Thời gian phải dạng HH:MM hoặc YYYY-MM-DD HH:MM")
 
 
 # ---------- Công cụ ----------
@@ -93,8 +216,7 @@ def tool_web_search(ctx, query: str) -> str:
             data={"api_key": TAVILY_API_KEY, "query": query,
                   "max_results": 3, "search_depth": "basic"},
         )
-        parts = [f"{r.get('title', '')}: {r.get('content', '')}"
-                 for r in data.get("results", [])]
+        parts = [f"{r.get('title', '')}: {r.get('content', '')}" for r in data.get("results", [])]
         return "\n".join(parts)[:2000] or "Không có kết quả"
 
     q = urllib.parse.quote(query)
@@ -147,46 +269,90 @@ def tool_set_volume(ctx, level: int = None, change: str = None) -> str:
     return f"Âm lượng hiện là {new} phần trăm"
 
 
-# ---------- Nhạc: Internet Archive ----------
+def tool_send_telegram(ctx, message: str) -> str:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return "Chưa cấu hình Telegram trên server"
+    text = (message or "").strip()[:4000]
+    if not text:
+        return "Nội dung tin nhắn trống"
+    data = http_json(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+    return "Đã gửi tin nhắn Telegram" if data.get("ok") else "Gửi Telegram thất bại"
+
+
+def tool_device_control(ctx, action: str) -> str:
+    if action == "on":
+        ctx["device"] = "on"
+        return "Sẽ bật thiết bị"
+    if action == "off":
+        ctx["device"] = "off"
+        return "Sẽ tắt thiết bị"
+    return "Hành động không hợp lệ"
+
+
+def tool_shutdown_bot(ctx) -> str:
+    ctx["standby"] = True
+    return "Sẽ chuyển về chế độ chờ sau lời tạm biệt"
+
+
+def tool_add_schedule(ctx, when: str, action: str, note: str = "") -> str:
+    if action not in ("device_on", "device_off", "remind"):
+        return "Hành động không hợp lệ"
+    t = parse_when(when)
+    if t <= datetime.now(TZ):
+        return "Thời gian này đã qua"
+    item = {"id": uuid.uuid4().hex[:6], "at": t.isoformat(), "action": action, "note": note[:200]}
+    sched_add(item)
+    label = {"device_on": "bật thiết bị", "device_off": "tắt thiết bị", "remind": "nhắc"}[action]
+    return f"Đã đặt lịch {label} lúc {t.strftime('%H giờ %M, ngày %d/%m/%Y')}, mã {item['id']}"
+
+
+def tool_list_schedules(ctx) -> str:
+    items = sched_read()
+    if not items:
+        return "Hiện không có lịch nào"
+    lines = []
+    for it in sorted(items, key=lambda x: x["at"]):
+        t = datetime.fromisoformat(it["at"]).astimezone(TZ)
+        lines.append(f"{it['id']}: {t.strftime('%H:%M %d/%m')} {it['action']} {it.get('note', '')}".strip())
+    return "; ".join(lines)
+
+
+def tool_cancel_schedule(ctx, schedule_id: str) -> str:
+    return "Đã hủy lịch" if sched_cancel(schedule_id) else "Không tìm thấy mã lịch này"
+
+
+# ---------- Nhạc ----------
 def archive_search_track(query: str):
-    """Tìm bài nhạc trên Internet Archive, trả về dict hoặc None."""
     clean = re.sub(r"[^\w\s]", " ", query, flags=re.UNICODE).strip()
     if not clean:
         return None
-
     q = f"({clean}) AND mediatype:audio AND collection:opensource_audio"
     params = urllib.parse.urlencode([
-        ("q", q),
-        ("fl[]", "identifier"), ("fl[]", "title"), ("fl[]", "creator"),
+        ("q", q), ("fl[]", "identifier"), ("fl[]", "title"), ("fl[]", "creator"),
         ("rows", "5"), ("output", "json"),
     ])
     data = http_json(f"{ARCHIVE_SEARCH_URL}?{params}", timeout=20)
-    docs = data.get("response", {}).get("docs", [])
-
-    for doc in docs:
+    for doc in data.get("response", {}).get("docs", []):
         ident = doc.get("identifier")
         if not ident:
             continue
         meta = http_json(f"https://archive.org/metadata/{ident}", timeout=20)
-        files = meta.get("files", [])
-
         mp3s = []
-        for f in files:
+        for f in meta.get("files", []):
             name = f.get("name", "")
             size = int(f.get("size", 0) or 0)
             if name.lower().endswith(".mp3") and ARCHIVE_MIN_BYTES <= size <= ARCHIVE_MAX_BYTES:
                 mp3s.append((size, name))
         if not mp3s:
             continue
-
         mp3s.sort(reverse=True)
         _, name = mp3s[0]
-
         creator = doc.get("creator") or ""
         if isinstance(creator, list):
             creator = ", ".join(creator)
         license_url = (meta.get("metadata", {}) or {}).get("licenseurl", "")
-
         return {
             "url": f"https://archive.org/download/{ident}/{urllib.parse.quote(name)}",
             "title": doc.get("title") or ident,
@@ -196,18 +362,13 @@ def archive_search_track(query: str):
     return None
 
 
-# ---------- Nhạc: công cụ phát nhạc ----------
 def tool_play_music(ctx, query: str) -> str:
     q = normalize(query)
-
-    # 1. Kho nhạc riêng
     for title, url in MY_SONGS.items():
         t = normalize(title)
         if q and (q in t or t in q):
             ctx["music"] = {"url": url, "title": title, "artist": "", "license": "kho riêng"}
             return f"Sẽ phát bài {title}"
-
-    # 2. Internet Archive
     try:
         track = archive_search_track(query)
     except Exception as e:
@@ -216,16 +377,13 @@ def tool_play_music(ctx, query: str) -> str:
     if track:
         ctx["music"] = track
         return f"Sẽ phát bài {track['title']} của {track['artist'] or 'không rõ'}"
-
-    # 3. Jamendo (dự phòng)
     if not JAMENDO_CLIENT_ID:
         return "Không tìm thấy bài này"
     url = "https://api.jamendo.com/v3.0/tracks/?" + urllib.parse.urlencode({
         "client_id": JAMENDO_CLIENT_ID, "format": "json", "limit": 1,
         "search": query, "audioformat": "mp32",
     })
-    data = http_json(url, timeout=15)
-    res = data.get("results") or []
+    res = http_json(url, timeout=15).get("results") or []
     if not res or not res[0].get("audio"):
         return "Không tìm thấy bài phù hợp"
     t = res[0]
@@ -240,35 +398,60 @@ TOOL_FUNCS = {
     "get_weather": tool_get_weather,
     "set_volume": tool_set_volume,
     "play_music": tool_play_music,
+    "send_telegram": tool_send_telegram,
+    "device_control": tool_device_control,
+    "shutdown_bot": tool_shutdown_bot,
+    "add_schedule": tool_add_schedule,
+    "list_schedules": tool_list_schedules,
+    "cancel_schedule": tool_cancel_schedule,
 }
 
 TOOLS = [
-    {"type": "function", "function": {
-        "name": "get_time",
+    {"type": "function", "function": {"name": "get_time",
         "description": "Lấy ngày và giờ hiện tại ở Việt Nam",
         "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {
-        "name": "web_search",
+    {"type": "function", "function": {"name": "web_search",
         "description": "Tìm thông tin mới trên web",
         "parameters": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "từ khóa tìm kiếm"}},
-            "required": ["query"]}}},
-    {"type": "function", "function": {
-        "name": "get_weather",
+            "query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "get_weather",
         "description": "Lấy thời tiết hiện tại của một thành phố",
         "parameters": {"type": "object", "properties": {
             "city": {"type": "string"}}, "required": ["city"]}}},
-    {"type": "function", "function": {
-        "name": "set_volume",
+    {"type": "function", "function": {"name": "set_volume",
         "description": "Chỉnh âm lượng loa. Dùng level hoặc change.",
         "parameters": {"type": "object", "properties": {
             "level": {"type": "integer", "minimum": 0, "maximum": 100},
             "change": {"type": "string", "enum": ["up", "down", "mute", "max"]}}}}},
-    {"type": "function", "function": {
-        "name": "play_music",
+    {"type": "function", "function": {"name": "play_music",
         "description": "Tìm và phát một bài nhạc có sẵn theo tên bài, ca sĩ hoặc thể loại",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "send_telegram",
+        "description": "Gửi một tin nhắn Telegram đến chủ nhân",
+        "parameters": {"type": "object", "properties": {
+            "message": {"type": "string"}}, "required": ["message"]}}},
+    {"type": "function", "function": {"name": "device_control",
+        "description": "Bật hoặc tắt thiết bị điện (đèn, quạt) do ESP32 điều khiển",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["on", "off"]}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "shutdown_bot",
+        "description": "Chuyển bot về chế độ chờ khi người dùng nói tạm biệt hoặc tắt bot",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "add_schedule",
+        "description": "Đặt lịch bật/tắt thiết bị hoặc nhắc việc theo giờ",
+        "parameters": {"type": "object", "properties": {
+            "when": {"type": "string", "description": "HH:MM hoặc YYYY-MM-DD HH:MM, giờ Việt Nam"},
+            "action": {"type": "string", "enum": ["device_on", "device_off", "remind"]},
+            "note": {"type": "string", "description": "nội dung nhắc (nếu action là remind)"}},
+            "required": ["when", "action"]}}},
+    {"type": "function", "function": {"name": "list_schedules",
+        "description": "Xem danh sách lịch đã đặt",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "cancel_schedule",
+        "description": "Hủy một lịch theo mã",
+        "parameters": {"type": "object", "properties": {
+            "schedule_id": {"type": "string"}}, "required": ["schedule_id"]}}},
 ]
 
 
@@ -303,12 +486,10 @@ def llm_chat(messages: list, tools=None, max_tokens: int = 300):
 def run_agent(history: list, user_text: str, ctx: dict) -> str:
     messages = ([{"role": "system", "content": system_prompt()}]
                 + history + [{"role": "user", "content": user_text}])
-
     for _ in range(4):
         msg = llm_chat(messages, TOOLS)
         if not msg.tool_calls:
             return (msg.content or "").strip()
-
         messages.append({
             "role": "assistant",
             "content": msg.content or "",
@@ -327,11 +508,10 @@ def run_agent(history: list, user_text: str, ctx: dict) -> str:
                 result = f"Lỗi: {e}"
                 print("Lỗi công cụ:", e, flush=True)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)[:2000]})
-
     return "Mình chưa xử lý xong yêu cầu, bạn thử lại nhé."
 
 
-# ---------- Nhận dạng giọng nói ----------
+# ---------- Giọng nói ----------
 def pcm_to_wav(pcm: bytes) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -344,14 +524,10 @@ def pcm_to_wav(pcm: bytes) -> bytes:
 
 def speech_to_text(pcm: bytes) -> str:
     result = groq_client.audio.transcriptions.create(
-        file=("audio.wav", pcm_to_wav(pcm)),
-        model=STT_MODEL,
-        language="vi",
-    )
+        file=("audio.wav", pcm_to_wav(pcm)), model=STT_MODEL, language="vi")
     return result.text or ""
 
 
-# ---------- Chống nhận lại tiếng loa ----------
 def is_echo(text: str, recent: list) -> bool:
     t = normalize(text)
     if len(t) < 6:
@@ -363,7 +539,6 @@ def is_echo(text: str, recent: list) -> bool:
     return False
 
 
-# ---------- Âm thanh ----------
 def normalize_pcm(pcm: bytes, peak_target: int) -> bytes:
     samples = array("h")
     samples.frombytes(pcm)
@@ -407,8 +582,60 @@ async def send_audio(ws: WebSocket, pcm: bytes):
     print(f"Đã gửi xong audio: {sent}/{len(pcm)} bytes", flush=True)
 
 
-async def play_music(ws: WebSocket, state: dict, track: dict):
-    """Phát nhạc nền. Luôn kết thúc bằng TTS_END để ESP32 quay lại chế độ nghe."""
+async def speak_and_end(ws: WebSocket, text: str):
+    """Nói một câu qua loa rồi báo kết thúc lượt."""
+    try:
+        await ws.send_text(text)
+        pcm = await text_to_speech_pcm(text)
+        await send_audio(ws, pcm)
+    except Exception as e:
+        print("Lỗi nói:", e, flush=True)
+    try:
+        await ws.send_text("TTS_END")
+    except Exception:
+        pass
+
+
+# ---------- Telegram ----------
+def tg_api(method: str, payload: dict):
+    return http_json(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+                     data=payload, timeout=15)
+
+
+async def tg_text(text: str, keyboard=None):
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]}
+    if keyboard:
+        payload["reply_markup"] = keyboard
+    try:
+        await asyncio.to_thread(tg_api, "sendMessage", payload)
+    except Exception as e:
+        print("Lỗi Telegram:", e, flush=True)
+
+
+async def send_device(cmd: str) -> bool:
+    ws = DEVICE["ws"]
+    if ws is None:
+        return False
+    try:
+        await ws.send_text(cmd)
+        return True
+    except Exception as e:
+        print("Lỗi gửi lệnh tới thiết bị:", e, flush=True)
+        return False
+
+
+OFFLINE_MSG = "Thiết bị đang offline, kiểm tra ESP32 đã bật và có WiFi."
+
+
+# ---------- Phát nhạc ----------
+def stop_music():
+    task = STATE.get("music_task")
+    if task and not task.done():
+        task.cancel()
+    STATE["music_task"] = None
+
+
+async def play_music(ws: WebSocket, track: dict):
     try:
         print("Phát nhạc:", track["title"], "-", track["artist"],
               "| license:", track.get("license", ""), flush=True)
@@ -420,63 +647,97 @@ async def play_music(ws: WebSocket, state: dict, track: dict):
     except Exception as e:
         print("Lỗi nhạc:", e, flush=True)
     finally:
-        state["music_task"] = None
+        STATE["music_task"] = None
         try:
             await ws.send_text("TTS_END")
         except Exception:
             pass
 
 
-# ---------- Một lượt hội thoại ----------
-async def handle_turn(ws: WebSocket, pcm: bytes, state: dict):
-    ctx = {"volume": state["volume"], "music": None}
+def start_music(ws: WebSocket, track: dict):
+    stop_music()
+    STATE["music_task"] = asyncio.create_task(play_music(ws, track))
+
+
+# ---------- Trả lời chung cho giọng nói và Telegram ----------
+async def answer(user_text: str, voice: bool) -> bool:
+    """Trả về True nếu đã bắt đầu phát nhạc (tác vụ nhạc sẽ tự gửi TTS_END)."""
+    ws = DEVICE["ws"]
+    ctx = {"volume": STATE["volume"], "music": None, "device": None, "standby": False}
+    try:
+        reply = await asyncio.to_thread(run_agent, STATE["history"], user_text, ctx)
+    except Exception as e:
+        print("Lỗi AI:", e, flush=True)
+        reply = f"Lỗi: {e}"
+    else:
+        STATE["history"].append({"role": "user", "content": user_text})
+        STATE["history"].append({"role": "assistant", "content": reply})
+        del STATE["history"][:-MAX_HISTORY]
+
+    if ctx["volume"] != STATE["volume"]:
+        STATE["volume"] = ctx["volume"]
+        if ws is not None:
+            try:
+                await ws.send_text(f"VOL:{STATE['volume']}")
+            except Exception:
+                pass
+
+    if ctx["device"]:
+        ok = await send_device("CMD:DEV_ON" if ctx["device"] == "on" else "CMD:DEV_OFF")
+        if not ok:
+            reply = (reply + " " if reply else "") + OFFLINE_MSG
+
+    if ctx["music"] and not reply:
+        reply = f"Đang phát {ctx['music']['title']}."
+    if not reply:
+        reply = "Mình chưa có câu trả lời, bạn nói lại nhé."
+
+    STATE["recent"] = (STATE["recent"] + [reply])[-3:]
+    print("Trả lời:", reply, flush=True)
+
+    music_started = False
+    if voice:
+        if ws is None:
+            return False
+        try:
+            await ws.send_text(reply)
+            pcm = await text_to_speech_pcm(reply)
+            print(f"TTS: {len(pcm)} bytes, đang phát", flush=True)
+            await send_audio(ws, pcm)
+        except Exception as e:
+            print("Lỗi TTS:", e, flush=True)
+    else:
+        await tg_text(reply)
+
+    if ctx["standby"]:
+        await send_device("CMD:STANDBY")
+
+    if ctx["music"]:
+        if DEVICE["ws"] is not None:
+            start_music(DEVICE["ws"], ctx["music"])
+            music_started = True
+        else:
+            await tg_text("Thiết bị chưa kết nối nên chưa phát được nhạc.")
+    return music_started
+
+
+async def handle_turn(ws: WebSocket, pcm: bytes):
     music_started = False
     try:
         if len(pcm) < MIN_BYTES:
             print("Âm thanh quá ngắn, bỏ qua", flush=True)
             return
-
         user_text = (await asyncio.to_thread(speech_to_text, pcm)).strip()
         print("Người dùng nói:", user_text, flush=True)
         if len(normalize(user_text)) < 2:
             return
-        if is_echo(user_text, state["recent"]):
+        if is_echo(user_text, STATE["recent"]):
             print("Bỏ qua: tiếng vọng từ loa", flush=True)
             return
-
-        try:
-            reply = await asyncio.to_thread(run_agent, state["history"], user_text, ctx)
-            history = state["history"]
-            history.append({"role": "user", "content": user_text})
-            history.append({"role": "assistant", "content": reply})
-            del history[:-MAX_HISTORY]
-        except Exception as e:
-            print("Lỗi AI:", e, flush=True)
-            reply = f"Lỗi: {e}"
-
-        if ctx["volume"] != state["volume"]:
-            state["volume"] = ctx["volume"]
-            await ws.send_text(f"VOL:{state['volume']}")
-
-        if ctx["music"] and not reply:
-            reply = f"Đang phát {ctx['music']['title']}."
-        if not reply:
-            return
-
-        state["recent"] = (state["recent"] + [reply])[-3:]
-        print("Trả lời:", reply, flush=True)
-        await ws.send_text(reply)
-
-        try:
-            pcm_out = await text_to_speech_pcm(reply)
-            print(f"TTS: {len(pcm_out)} bytes, đang phát", flush=True)
-            await send_audio(ws, pcm_out)
-        except Exception as e:
-            print("Lỗi TTS:", e, flush=True)
-
-        if ctx["music"]:
-            music_started = True
-            state["music_task"] = asyncio.create_task(play_music(ws, state, ctx["music"]))
+        await ws.send_text("USER:" + user_text)
+        music_started = await answer(user_text, voice=True)
+    except Exception as e:
+        print("Lỗi lượt nói:", e, flush=True)
     finally:
         if not music_started:
             try:
@@ -485,27 +746,236 @@ async def handle_turn(ws: WebSocket, pcm: bytes, state: dict):
                 pass
 
 
+# ---------- Chào khi thiết bị khởi động ----------
+async def welcome(ws: WebSocket):
+    greeting = "Kính chào chủ nhân."
+    try:
+        await ws.send_text(greeting)
+        pcm = await text_to_speech_pcm(greeting)
+        await send_audio(ws, pcm)
+    except Exception as e:
+        print("Lỗi chào:", e, flush=True)
+    if WELCOME_MUSIC_URL:
+        start_music(ws, {"url": WELCOME_MUSIC_URL, "title": "nhạc chào mừng",
+                         "artist": "", "license": "tự cấu hình"})
+    else:
+        try:
+            await ws.send_text("TTS_END")
+        except Exception:
+            pass
+
+
+# ---------- Lịch hẹn ----------
+async def run_schedule(item: dict):
+    action = item["action"]
+    note = item.get("note", "")
+    if action == "device_on":
+        ok = await send_device("CMD:DEV_ON")
+        msg = "Đã bật thiết bị theo lịch."
+    elif action == "device_off":
+        ok = await send_device("CMD:DEV_OFF")
+        msg = "Đã tắt thiết bị theo lịch."
+    else:
+        ok = True
+        msg = f"Nhắc bạn: {note}"
+    if not ok and action != "remind":
+        msg += " Nhưng thiết bị đang offline."
+    await tg_text(msg)
+    if DEVICE["ws"] is not None:
+        await speak_and_end(DEVICE["ws"], msg)
+
+
+async def scheduler_loop():
+    while True:
+        await asyncio.sleep(20)
+        if not UPSTASH_URL:
+            continue
+        try:
+            items = await asyncio.to_thread(sched_read)
+            now = datetime.now(TZ)
+            due = [i for i in items if datetime.fromisoformat(i["at"]) <= now]
+            if due:
+                await asyncio.to_thread(sched_remove, [d["id"] for d in due])
+                for it in due:
+                    await run_schedule(it)
+        except Exception as e:
+            print("Lỗi lịch:", e, flush=True)
+
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(scheduler_loop())
+
+
+# ---------- Vị trí và rời nhà ----------
+def cancel_leave():
+    STATE["leave_pending"] = False
+    task = STATE.get("leave_task")
+    if task and not task.done():
+        task.cancel()
+    STATE["leave_task"] = None
+
+
+async def leave_timeout():
+    try:
+        await asyncio.sleep(LEAVE_TIMEOUT_S)
+    except asyncio.CancelledError:
+        return
+    if STATE["leave_pending"]:
+        STATE["leave_pending"] = False
+        ok = await send_device("CMD:DEV_OFF")
+        if ok:
+            await tg_text("Hết 5 phút không có phản hồi, mình đã tự tắt thiết bị để an toàn.")
+        else:
+            await tg_text("Hết 5 phút, nhưng thiết bị đang offline nên chưa tắt được.")
+
+
+async def on_location(lat: float, lng: float):
+    if HOME_LAT == 0 and HOME_LNG == 0:
+        await tg_text("Chưa cấu hình tọa độ nhà (HOME_LAT, HOME_LNG) trên Render.")
+        return
+    d = distance_m(lat, lng, HOME_LAT, HOME_LNG)
+    prev = STATE["at_home"]
+    # Có vùng đệm 50 m để GPS nhảy qua lại không gây báo nhiều lần
+    if d <= HOME_RADIUS_M:
+        now_home = True
+    elif d > HOME_RADIUS_M + 50:
+        now_home = False
+    else:
+        now_home = prev if prev is not None else False
+    STATE["at_home"] = now_home
+
+    if now_home:
+        if STATE["leave_pending"]:
+            cancel_leave()
+            await tg_text("Bạn đã về nhà, mình đã hủy việc tự tắt thiết bị.")
+        elif prev is False:
+            await tg_text("Chào mừng bạn về nhà.")
+        return
+
+    if prev is True and STATE["device_on"] and not STATE["leave_pending"]:
+        STATE["leave_pending"] = True
+        STATE["leave_task"] = asyncio.create_task(leave_timeout())
+        await tg_text(
+            f"Bạn đã ra khỏi nhà (cách khoảng {int(d)} m). Thiết bị đang bật. "
+            "Bạn có muốn tắt không? Nếu không trả lời trong 5 phút, mình sẽ tự tắt.",
+            LEAVE_KEYBOARD)
+
+
+# ---------- Xử lý cập nhật từ Telegram ----------
+def status_text() -> str:
+    online = "online" if DEVICE["ws"] is not None else "offline"
+    dev = "bật" if STATE["device_on"] else "tắt"
+    if STATE["at_home"] is None:
+        place = "chưa rõ"
+    else:
+        place = "ở nhà" if STATE["at_home"] else "ngoài nhà"
+    return f"Thiết bị: {online}\nĐèn/quạt: {dev}\nVị trí: {place}"
+
+
+async def run_button(data: str):
+    if data == "dev_on":
+        ok = await send_device("CMD:DEV_ON")
+        await tg_text("Đã bật thiết bị." if ok else OFFLINE_MSG, MENU_KEYBOARD)
+    elif data == "dev_off":
+        ok = await send_device("CMD:DEV_OFF")
+        await tg_text("Đã tắt thiết bị." if ok else OFFLINE_MSG, MENU_KEYBOARD)
+    elif data == "start":
+        ok = await send_device("CMD:START")
+        await tg_text("Đã bật micro, bot đang nghe bạn." if ok else OFFLINE_MSG, MENU_KEYBOARD)
+    elif data == "stop":
+        ok = await send_device("CMD:STOP")
+        await tg_text("Đã dừng micro." if ok else OFFLINE_MSG, MENU_KEYBOARD)
+    elif data == "status":
+        await tg_text(status_text(), MENU_KEYBOARD)
+    elif data == "list":
+        try:
+            await tg_text("Lịch: " + await asyncio.to_thread(tool_list_schedules, {}), MENU_KEYBOARD)
+        except Exception as e:
+            await tg_text(f"Không đọc được lịch: {e}", MENU_KEYBOARD)
+    elif data == "bye":
+        ws = DEVICE["ws"]
+        if ws is not None:
+            await speak_and_end(ws, "Tạm biệt chủ nhân.")
+            await send_device("CMD:STANDBY")
+            await tg_text("Thiết bị đã chuyển về chế độ chờ.", MENU_KEYBOARD)
+        else:
+            await tg_text(OFFLINE_MSG, MENU_KEYBOARD)
+    elif data == "leave_off":
+        cancel_leave()
+        ok = await send_device("CMD:DEV_OFF")
+        await tg_text("Đã tắt thiết bị." if ok else OFFLINE_MSG)
+    elif data == "leave_keep":
+        cancel_leave()
+        await tg_text("Đã giữ thiết bị bật.")
+
+
+async def telegram_agent_text(text: str):
+    await answer(text, voice=False)
+
+
+async def handle_telegram_update(update: dict):
+    if "callback_query" in update:
+        cq = update["callback_query"]
+        chat = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+        if chat != str(TELEGRAM_CHAT_ID):
+            return
+        await asyncio.to_thread(tg_api, "answerCallbackQuery", {"callback_query_id": cq["id"]})
+        await run_button(cq.get("data", ""))
+        return
+
+    msg = update.get("message") or update.get("edited_message")
+    if not msg:
+        return
+    if str(msg.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID):
+        return
+
+    loc = msg.get("location")
+    if loc:
+        await on_location(loc["latitude"], loc["longitude"])
+        return
+
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return
+    if text.lower() in ("/start", "/menu", "menu"):
+        await tg_text("Chọn thao tác cho bot:", MENU_KEYBOARD)
+        return
+    await telegram_agent_text(text)
+
+
+async def safe_handle(update: dict):
+    try:
+        await handle_telegram_update(update)
+    except Exception as e:
+        print("Lỗi xử lý Telegram:", e, flush=True)
+
+
+@app.post("/telegram/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if not TELEGRAM_WEBHOOK_SECRET or secret != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404)
+    update = await request.json()
+    # Trả lời Telegram ngay, xử lý nền để tránh bị gửi lại cập nhật
+    asyncio.create_task(safe_handle(update))
+    return {"ok": True}
+
+
 @app.get("/")
 def root():
     return {"status": "ok"}
 
 
+# ---------- WebSocket với ESP32 ----------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    DEVICE["ws"] = websocket
     print("ESP32 đã kết nối", flush=True)
-
-    state = {"volume": DEFAULT_VOLUME, "recent": [], "history": [], "music_task": None}
-    await websocket.send_text(f"VOL:{state['volume']}")
+    await websocket.send_text(f"VOL:{STATE['volume']}")
 
     audio_buffer = bytearray()
     recording = False
-
-    def stop_music():
-        task = state.get("music_task")
-        if task and not task.done():
-            task.cancel()
-        state["music_task"] = None
 
     try:
         while True:
@@ -535,15 +1005,27 @@ async def websocket_endpoint(websocket: WebSocket):
                 recording = False
                 audio_buffer.clear()
                 stop_music()
-                state["history"].clear()
-                state["recent"].clear()
+                STATE["history"].clear()
+                STATE["recent"].clear()
                 print("Kết thúc hội thoại, xóa lịch sử", flush=True)
+
+            elif text.startswith("SETVOL:"):
+                try:
+                    STATE["volume"] = max(0, min(100, int(text[7:])))
+                except ValueError:
+                    pass
+
+            elif text.startswith("STATE:"):
+                STATE["device_on"] = (text == "STATE:ON")
+
+            elif text == "HELLO":
+                asyncio.create_task(welcome(websocket))
 
             elif text == "STOP_RECORDING":
                 recording = False
                 pcm = bytes(audio_buffer)
                 audio_buffer.clear()
-                await handle_turn(websocket, pcm, state)
+                await handle_turn(websocket, pcm)
 
     except WebSocketDisconnect:
         pass
@@ -551,5 +1033,7 @@ async def websocket_endpoint(websocket: WebSocket):
         print("Lỗi kết nối:", e, flush=True)
     finally:
         stop_music()
+        if DEVICE["ws"] is websocket:
+            DEVICE["ws"] = None
 
     print("ESP32 ngắt kết nối", flush=True)
