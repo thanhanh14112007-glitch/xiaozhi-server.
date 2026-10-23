@@ -32,7 +32,6 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
 HOME_LAT = float(os.environ.get("HOME_LAT", "0") or 0)
 HOME_LNG = float(os.environ.get("HOME_LNG", "0") or 0)
 HOME_RADIUS_M = float(os.environ.get("HOME_RADIUS_M", "500") or 500)
-WELCOME_MUSIC_URL = os.environ.get("WELCOME_MUSIC_URL", "").strip()
 
 TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 SAMPLE_RATE = 16000
@@ -1024,25 +1023,6 @@ async def handle_turn(ws: WebSocket, pcm: bytes):
                 pass
 
 
-# ---------- Chào khi thiết bị khởi động ----------
-async def welcome(ws: WebSocket):
-    greeting = "Kính chào chủ nhân."
-    try:
-        await ws.send_text(greeting)
-        pcm = await text_to_speech_pcm(greeting)
-        await send_audio(ws, pcm)
-    except Exception as e:
-        print("Lỗi chào:", e, flush=True)
-    if WELCOME_MUSIC_URL:
-        start_music(ws, {"url": WELCOME_MUSIC_URL, "title": "nhạc chào mừng",
-                         "artist": "", "license": "tự cấu hình"})
-    else:
-        try:
-            await ws.send_text("TTS_END")
-        except Exception:
-            pass
-
-
 # ---------- Lịch hẹn ----------
 async def ring_alarm() -> bool:
     if DEVICE["ws"] is None:
@@ -1433,7 +1413,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     STATE["devices"][parts[1]] = (parts[2] == "ON")
 
             elif text == "HELLO":
-                asyncio.create_task(welcome(websocket))
+                # Đã loại bỏ hàm welcome() cũ gây lỗi URL, giờ chỉ gửi lời chào cơ bản gọn gàng
+                asyncio.create_task(speak_and_end(websocket, "Kính chào chủ nhân."))
 
             elif text == "STOP_RECORDING":
                 recording = False
