@@ -797,6 +797,12 @@ def is_echo(text: str, recent: list) -> bool:
     return False
 
 
+def pcm_peak(pcm: bytes) -> int:
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+    return max((abs(x) for x in samples), default=0)
+
+
 def normalize_pcm(pcm: bytes, peak_target: int) -> bytes:
     samples = array("h")
     samples.frombytes(pcm)
@@ -818,7 +824,12 @@ async def text_to_speech_pcm(text: str) -> bytes:
         raise RuntimeError("TTS không trả về audio")
     decoded = miniaudio.decode(bytes(mp3), output_format=miniaudio.SampleFormat.SIGNED16,
                                nchannels=1, sample_rate=SAMPLE_RATE)
-    return await asyncio.to_thread(normalize_pcm, decoded.samples.tobytes(), TTS_PEAK)
+    pcm = await asyncio.to_thread(normalize_pcm, decoded.samples.tobytes(), TTS_PEAK)
+    peak = pcm_peak(pcm)
+    print(f"TTS: mp3 {len(mp3)} bytes, pcm {len(pcm)} bytes, peak {peak}", flush=True)
+    if peak == 0:
+        raise RuntimeError("Âm thanh TTS bị trống (peak = 0)")
+    return pcm
 
 
 def download_track_pcm(url: str) -> bytes:
@@ -831,6 +842,7 @@ def download_track_pcm(url: str) -> bytes:
 
 
 async def send_audio(ws: WebSocket, pcm: bytes):
+    print(f"Chuẩn bị gửi audio: {len(pcm)} bytes, peak toàn câu = {pcm_peak(pcm)}", flush=True)
     bytes_per_s = SAMPLE_RATE * 2
     start = time.monotonic()
     sent = 0
@@ -954,7 +966,6 @@ async def answer(user_text: str, voice: bool) -> bool:
         try:
             await ws.send_text(reply)
             pcm = await text_to_speech_pcm(reply)
-            print(f"TTS: {len(pcm)} bytes, đang phát", flush=True)
             await send_audio(ws, pcm)
         except Exception as e:
             print("Lỗi TTS:", e, flush=True)
