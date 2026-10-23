@@ -41,18 +41,24 @@ STT_MODEL = "whisper-large-v3"
 MAX_HISTORY = 10
 LEAVE_TIMEOUT_S = 300
 SCHEDULE_KEY = "xiaozhi:schedules"
+MEMORY_KEY = "xiaozhi:memory"
+MAX_MEMORY = 100
+MEMORY_IN_PROMPT = 40
 OFFLINE_MSG = "Thiết bị đang offline, kiểm tra ESP32 đã bật và có WiFi."
 
-ALARM_SECONDS = 5.0                    # thời lượng chuông reo trên loa (phải khớp với ESP32)
+ALARM_SECONDS = 5.0                    # phải khớp ALARM_MS trên ESP32
+ACK_REPEAT_S = 120                     # nhắc lại mỗi 2 phút nếu chưa xác nhận
+MAX_ACK_REPEAT = 15                    # nhắc tối đa 15 lần rồi tạm dừng lịch
+OFFLINE_RETRY_S = 60                   # lịch điều khiển khi ESP32 offline: thử lại mỗi phút
+MAX_OFFLINE_TRIES = 30
 
 TTS_VOICE = "vi-VN-HoaiMyNeural"
-TTS_CHUNK = 4096                       # ~128 ms âm thanh mỗi gói
-SEND_AHEAD_S = 1.5                     # server gửi trước 1,5 giây để ESP32 có đệm
+TTS_CHUNK = 4096
+SEND_AHEAD_S = 1.5
 TTS_PEAK = int(0.6 * 32767)
 MUSIC_PEAK = int(0.35 * 32767)
 DEFAULT_VOLUME = 70
 
-# Thiết bị điều khiển được, khớp với ESP32 (mỗi thiết bị một màu LED)
 DEVICES = {
     "den":     {"label": "đèn",      "color": "đỏ"},
     "maylanh": {"label": "máy lạnh", "color": "xanh lá"},
@@ -79,13 +85,14 @@ STATE = {
     "recent": [],
     "history": [],
     "music_task": None,
-    "devices": {k: False for k in DEVICES},   # trạng thái thật do ESP32 báo lên
+    "devices": {k: False for k in DEVICES},
     "at_home": None,
     "leave_pending": False,
     "leave_task": None,
 }
 DEVICE = {"ws": None}
 SCHED_LOCK = threading.Lock()
+MEM_LOCK = threading.Lock()
 
 
 def build_menu() -> dict:
@@ -109,11 +116,15 @@ def build_menu() -> dict:
 
 MENU_KEYBOARD = {"inline_keyboard": [
     [{"text": "Bật đèn", "callback_data": "dev:den:on"}],
-]}  # đánh dấu để tg_text biết cần dựng menu mới
+]}  # đánh dấu: tg_text sẽ dựng menu mới theo trạng thái
 
 LEAVE_KEYBOARD = {"inline_keyboard": [
     [{"text": "Tắt tất cả", "callback_data": "leave_off"},
      {"text": "Giữ bật", "callback_data": "leave_keep"}],
+]}
+
+ACK_KEYBOARD = {"inline_keyboard": [
+    [{"text": "Đã nhớ", "callback_data": "ack"}],
 ]}
 
 DEVICE_RULES = (
@@ -121,6 +132,10 @@ DEVICE_RULES = (
     "Khi người dùng nói bật hoặc tắt một thiết bị, gọi device_control với device và action. "
     "Khi người dùng nói tắt tất cả, gọi device_control với device là tatca và action là off. "
     "Khi người dùng đặt hẹn hoặc nhắc việc theo giờ, gọi add_schedule. "
+    "Khi người dùng nhờ ghi nhớ điều gì (ví dụ 'nhớ giúp tôi', 'hãy nhớ'), gọi remember với note là nội dung cần nhớ, "
+    "rồi trả lời ngắn gọn 'Ok, đã nhớ.' "
+    "Khi người dùng nhờ quên điều gì, gọi forget_memory với keyword là từ khóa liên quan. "
+    "Khi người dùng hỏi về điều bạn đã nhớ, trả lời dựa trên danh sách ghi nhớ. "
     "Khi cần thông tin mới (thời tiết, tin tức, giá cả, sự kiện) hãy gọi công cụ trước khi trả lời. "
     "Khi người dùng nhờ phát nhạc hoặc hát, gọi play_music. Bạn không tự hát được bài mới. "
     "Khi người dùng nói tạm biệt hoặc tắt bot, gọi shutdown_bot. "
@@ -144,13 +159,25 @@ TEXT_PROMPT = (
 )
 
 
+def mem_prompt() -> str:
+    try:
+        items = mem_read()
+    except Exception:
+        return ""
+    if not items:
+        return ""
+    recent = items[-MEMORY_IN_PROMPT:]
+    return "Những điều bạn đã ghi nhớ về chủ nhân: " + " | ".join(i["text"] for i in recent) + "."
+
+
 def system_prompt(mode: str = "voice") -> str:
     now = datetime.now(TZ).strftime("%H:%M, ngày %d/%m/%Y")
     base = TEXT_PROMPT if mode == "text" else VOICE_PROMPT
     status = "Trạng thái thiết bị hiện tại: " + "; ".join(
         f"{v['label']} {'đang bật' if STATE['devices'].get(k) else 'đang tắt'}"
         for k, v in DEVICES.items())
-    return f"{base} {DEVICE_RULES} {status}. Thời gian hiện tại ở Việt Nam: {now}."
+    mem = mem_prompt()
+    return f"{base} {DEVICE_RULES} {status}. {mem} Thời gian hiện tại ở Việt Nam: {now}."
 
 
 def normalize(s: str) -> str:
@@ -175,7 +202,7 @@ def http_json(url: str, data=None, timeout: int = 10):
         return json.loads(r.read().decode("utf-8"))
 
 
-# ---------- Upstash: lưu lịch bền vững ----------
+# ---------- Upstash: lưu lịch và ghi nhớ bền vững ----------
 def upstash_ready() -> bool:
     return bool(UPSTASH_URL and UPSTASH_TOKEN)
 
@@ -195,48 +222,106 @@ def redis_cmd(*args):
     return data.get("result")
 
 
-def load_schedules():
-    raw = redis_cmd("GET", SCHEDULE_KEY)
+def load_json(key: str) -> list:
+    raw = redis_cmd("GET", key)
     return json.loads(raw) if raw else []
 
 
-def save_schedules(items):
-    redis_cmd("SET", SCHEDULE_KEY, json.dumps(items, ensure_ascii=False))
+def save_json(key: str, items: list):
+    redis_cmd("SET", key, json.dumps(items, ensure_ascii=False))
 
 
 def sched_read():
     with SCHED_LOCK:
-        return load_schedules()
+        return load_json(SCHEDULE_KEY)
 
 
 def sched_add(item):
     with SCHED_LOCK:
-        items = load_schedules()
+        items = load_json(SCHEDULE_KEY)
         items.append(item)
-        save_schedules(items)
+        save_json(SCHEDULE_KEY, items)
 
 
 def sched_update(item):
     with SCHED_LOCK:
-        items = load_schedules()
+        items = load_json(SCHEDULE_KEY)
         items = [item if i["id"] == item["id"] else i for i in items]
-        save_schedules(items)
+        save_json(SCHEDULE_KEY, items)
 
 
 def sched_remove(ids):
     with SCHED_LOCK:
-        items = load_schedules()
-        save_schedules([i for i in items if i["id"] not in ids])
+        items = load_json(SCHEDULE_KEY)
+        save_json(SCHEDULE_KEY, [i for i in items if i["id"] not in ids])
 
 
 def sched_cancel(sid: str) -> bool:
     with SCHED_LOCK:
-        items = load_schedules()
+        items = load_json(SCHEDULE_KEY)
         new = [i for i in items if i["id"] != sid]
         if len(new) == len(items):
             return False
-        save_schedules(new)
+        save_json(SCHEDULE_KEY, new)
         return True
+
+
+def has_pending() -> bool:
+    """Có lịch nào đã nhắc và đang chờ xác nhận 'đã nhớ' không."""
+    try:
+        return any(i.get("fired") for i in sched_read())
+    except Exception as e:
+        print("Lỗi kiểm tra lịch chờ:", e, flush=True)
+        return False
+
+
+def ack_all_pending() -> int:
+    """Đã nhớ: xóa hẳn các lịch đã nhắc khỏi Upstash. Trả về số lịch đã xóa."""
+    with SCHED_LOCK:
+        items = load_json(SCHEDULE_KEY)
+        done = [i for i in items if i.get("fired")]
+        if not done:
+            return 0
+        keep = [i for i in items if not i.get("fired")]
+        save_json(SCHEDULE_KEY, keep)
+    for i in done:
+        print("Đã xóa lịch trên Upstash:", i["id"], i.get("action"), flush=True)
+    return len(done)
+
+
+def is_ack_text(text: str) -> bool:
+    t = normalize(text)
+    keys = ["đã nhớ", "nhớ rồi", "đã biết", "biết rồi", "rõ rồi", "đã rõ", "ghi nhớ rồi", "ok nhớ"]
+    if any(k in t for k in keys):
+        return True
+    return t in ("ok", "oke", "ừ", "rồi", "được", "ok rồi")
+
+
+def mem_read():
+    return load_json(MEMORY_KEY)
+
+
+def mem_add(text: str) -> dict:
+    with MEM_LOCK:
+        items = load_json(MEMORY_KEY)
+        item = {"id": uuid.uuid4().hex[:6], "text": text,
+                "at": datetime.now(TZ).isoformat()}
+        items.append(item)
+        save_json(MEMORY_KEY, items[-MAX_MEMORY:])
+        return item
+
+
+def mem_forget(keyword: str) -> int:
+    kw = normalize(keyword)
+    if not kw:
+        return 0
+    with MEM_LOCK:
+        items = load_json(MEMORY_KEY)
+        keep = [i for i in items if kw not in normalize(i["text"])]
+        removed = len(items) - len(keep)
+        if removed:
+            save_json(MEMORY_KEY, keep)
+        return removed
 
 
 def parse_when(s: str) -> datetime:
@@ -413,7 +498,7 @@ def tool_add_schedule(ctx, when: str, action: str, device: str = "", note: str =
     if t <= datetime.now(TZ):
         return "Thời gian này đã qua, hãy chọn giờ khác"
     item = {"id": uuid.uuid4().hex[:6], "at": t.isoformat(), "action": action,
-            "device": device, "note": note[:200], "tries": 0}
+            "device": device, "note": note[:200], "tries": 0, "fired": False}
     try:
         sched_add(item)
     except Exception as e:
@@ -438,12 +523,44 @@ def tool_list_schedules(ctx) -> str:
         else:
             name = DEVICES.get(it.get("device", ""), {}).get("label", "?")
             what = ("bật " if it["action"] == "device_on" else "tắt ") + name
+        if it.get("fired"):
+            what += " (chờ xác nhận)"
         lines.append(f"{it['id']}: {t.strftime('%H:%M %d/%m')} {what}")
     return "; ".join(lines)
 
 
 def tool_cancel_schedule(ctx, schedule_id: str) -> str:
     return "Đã hủy lịch" if sched_cancel(schedule_id) else "Không tìm thấy mã lịch này"
+
+
+def tool_remember(ctx, note: str) -> str:
+    note = (note or "").strip()[:200]
+    if not note:
+        return "Nội dung cần nhớ đang trống"
+    try:
+        mem_add(note)
+    except Exception as e:
+        print("Lỗi ghi nhớ:", e, flush=True)
+        return f"Không lưu được ghi nhớ: {e}"
+    return f"Đã nhớ: {note}"
+
+
+def tool_forget_memory(ctx, keyword: str) -> str:
+    try:
+        n = mem_forget(keyword)
+    except Exception as e:
+        return f"Không xóa được: {e}"
+    return f"Đã quên {n} điều liên quan" if n else "Không tìm thấy điều nào để quên"
+
+
+def tool_list_memory(ctx) -> str:
+    try:
+        items = mem_read()
+    except Exception as e:
+        return f"Không đọc được ghi nhớ: {e}"
+    if not items:
+        return "Hiện chưa nhớ điều gì"
+    return "; ".join(f"{i['id']}: {i['text']}" for i in items)
 
 
 # ---------- Nhạc ----------
@@ -527,6 +644,9 @@ TOOL_FUNCS = {
     "add_schedule": tool_add_schedule,
     "list_schedules": tool_list_schedules,
     "cancel_schedule": tool_cancel_schedule,
+    "remember": tool_remember,
+    "forget_memory": tool_forget_memory,
+    "list_memory": tool_list_memory,
 }
 
 TOOLS = [
@@ -564,7 +684,7 @@ TOOLS = [
         "description": "Chuyển bot về chế độ chờ khi người dùng nói tạm biệt hoặc tắt bot",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "add_schedule",
-        "description": "Đặt lịch bật hoặc tắt một thiết bị, hoặc nhắc việc theo giờ. Với remind, note là nội dung cần nhắc, ví dụ 'đi giặt đồ'.",
+        "description": "Đặt lịch bật hoặc tắt một thiết bị, hoặc nhắc việc theo giờ. Với remind, note là nội dung cần nhắc.",
         "parameters": {"type": "object", "properties": {
             "when": {"type": "string", "description": "HH:MM hoặc YYYY-MM-DD HH:MM, giờ Việt Nam"},
             "action": {"type": "string", "enum": ["device_on", "device_off", "remind"]},
@@ -578,6 +698,18 @@ TOOLS = [
         "description": "Hủy một lịch theo mã",
         "parameters": {"type": "object", "properties": {
             "schedule_id": {"type": "string"}}, "required": ["schedule_id"]}}},
+    {"type": "function", "function": {"name": "remember",
+        "description": "Ghi nhớ một điều người dùng nhờ nhớ, ví dụ sở thích, thông tin cá nhân, việc hay làm",
+        "parameters": {"type": "object", "properties": {
+            "note": {"type": "string", "description": "nội dung cần nhớ, viết ngắn gọn"}},
+            "required": ["note"]}}},
+    {"type": "function", "function": {"name": "forget_memory",
+        "description": "Quên các điều đã nhớ có chứa từ khóa",
+        "parameters": {"type": "object", "properties": {
+            "keyword": {"type": "string"}}, "required": ["keyword"]}}},
+    {"type": "function", "function": {"name": "list_memory",
+        "description": "Liệt kê những điều đã ghi nhớ",
+        "parameters": {"type": "object", "properties": {}}}},
 ]
 
 
@@ -733,7 +865,7 @@ def tg_api(method: str, payload: dict):
 
 async def tg_text(text: str, keyboard=None):
     if keyboard is MENU_KEYBOARD:
-        keyboard = build_menu()          # menu luôn hiện trạng thái mới nhất
+        keyboard = build_menu()
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]}
     if keyboard:
         payload["reply_markup"] = keyboard
@@ -778,7 +910,6 @@ def start_music(ws: WebSocket, track: dict):
 
 # ---------- Trả lời chung: giọng nói và Telegram ----------
 async def answer(user_text: str, voice: bool) -> bool:
-    """voice=True: trả lời bằng loa ESP32. voice=False: trả lời bằng chữ Telegram và đọc qua loa."""
     mode = "voice" if voice else "text"
     ctx = {"volume": STATE["volume"], "music": None, "devcmds": [], "standby": False}
     try:
@@ -845,7 +976,7 @@ async def answer(user_text: str, voice: bool) -> bool:
 
 
 async def handle_turn(ws: WebSocket, pcm: bytes):
-    music_started = False
+    ended = False
     try:
         if len(pcm) < MIN_BYTES:
             print("Âm thanh quá ngắn, bỏ qua", flush=True)
@@ -858,11 +989,24 @@ async def handle_turn(ws: WebSocket, pcm: bytes):
             print("Bỏ qua: tiếng vọng từ loa", flush=True)
             return
         await ws.send_text("USER:" + user_text)
-        music_started = await answer(user_text, voice=True)
+
+        # Đang có lịch chờ xác nhận và người dùng nói "đã nhớ": xóa lịch khỏi Upstash
+        if is_ack_text(user_text) and await asyncio.to_thread(has_pending):
+            try:
+                n = await asyncio.to_thread(ack_all_pending)
+                reply = "Ok, mình đã ghi nhận. Lịch hẹn đã kết thúc."
+            except Exception as e:
+                print("Lỗi xóa lịch khi đã nhớ (giọng nói):", e, flush=True)
+                reply = "Mình chưa xóa được lịch, bạn thử lại nhé."
+            await speak_and_end(ws, reply)
+            ended = True
+            return
+
+        ended = await answer(user_text, voice=True)
     except Exception as e:
         print("Lỗi lượt nói:", e, flush=True)
     finally:
-        if not music_started:
+        if not ended:
             try:
                 await ws.send_text("TTS_END")
             except Exception:
@@ -890,7 +1034,6 @@ async def welcome(ws: WebSocket):
 
 # ---------- Lịch hẹn ----------
 async def ring_alarm() -> bool:
-    """Gửi lệnh reo chuông tới ESP32 và đợi chuông reo xong. Trả về False nếu offline."""
     if DEVICE["ws"] is None:
         return False
     await send_raw("CMD:ALARM")
@@ -898,39 +1041,38 @@ async def ring_alarm() -> bool:
     return True
 
 
-async def run_schedule(item: dict) -> bool:
+async def run_schedule(item: dict, first: bool) -> bool:
     """
-    Trả về True nếu đã xử lý xong lịch (kể cả khi loa offline, Telegram vẫn nhận tin).
-    Trả về False chỉ với lịch điều khiển thiết bị khi ESP32 offline, để thử lại sau.
+    Trả về False chỉ khi lần đầu chạy lịch điều khiển thiết bị mà ESP32 offline (để thử lại).
+    Các lần nhắc lại luôn coi là thành công.
     """
     action = item["action"]
+    note = (item.get("note") or "").strip()
 
     if action in ("device_on", "device_off"):
         name = item.get("device", "")
         on = action == "device_on"
         label = DEVICES.get(name, {}).get("label", name)
-        if DEVICE["ws"] is None:
-            return False                       # thiết bị offline: thử lại sau
-        await ring_alarm()
-        ok = await send_device(name, on)
-        if ok:
-            STATE["devices"][name] = on
         verb = "bật" if on else "tắt"
-        msg = (f"Đã {verb} {label} theo lịch." if ok
-               else f"Không {verb} được {label} vì thiết bị offline.")
-
+        if first and DEVICE["ws"] is None:
+            return False
+        await ring_alarm()
+        if first:
+            ok = await send_device(name, on)
+            if ok:
+                STATE["devices"][name] = on
+            base = (f"Đã {verb} {label} theo lịch." if ok
+                    else f"Không {verb} được {label} vì thiết bị offline.")
+        else:
+            base = f"Nhắc lại: lịch {verb} {label} đã thực hiện."
     else:
-        note = (item.get("note") or "").strip()
-        msg = f"Đến giờ rồi, bạn nhớ: {note}" if note else "Đến giờ rồi."
-        if DEVICE["ws"] is not None:
-            await ring_alarm()
+        base = f"Đến giờ rồi, bạn nhớ: {note}" if first else f"Nhắc lại: bạn nhớ {note}"
+        await ring_alarm()
 
-    # Luôn nhắn Telegram để điện thoại có thông báo, dù loa có online hay không
-    await tg_text("🔔 " + msg)
-
-    # Nếu loa online thì đọc nội dung sau khi chuông reo
+    text = base + " Bạn đã nhớ chưa? Nói đã nhớ hoặc bấm nút để kết thúc."
+    await tg_text("🔔 " + text, ACK_KEYBOARD)
     if DEVICE["ws"] is not None:
-        await speak_and_end(DEVICE["ws"], msg)
+        await speak_and_end(DEVICE["ws"], text)
     return True
 
 
@@ -942,19 +1084,49 @@ async def scheduler_loop():
             continue
         try:
             items = await asyncio.to_thread(sched_read)
-            now = datetime.now(TZ)
-            due = [i for i in items if datetime.fromisoformat(i["at"]) <= now]
-            for it in due:
-                print("Đến giờ lịch:", it["id"], it["action"], it.get("device", ""), flush=True)
-                ok = await run_schedule(it)
-                if ok or it.get("tries", 0) >= 30:
-                    await asyncio.to_thread(sched_remove, [it["id"]])
+        except Exception as e:
+            print("Lỗi đọc lịch:", e, flush=True)
+            continue
+        now = datetime.now(TZ)
+        due = [i for i in items if datetime.fromisoformat(i["at"]) <= now]
+        for it in due:
+            first = not it.get("fired", False)
+            print("Lịch đến hạn:", it["id"], it.get("action"),
+                  "lần đầu" if first else "nhắc lại", flush=True)
+            try:
+                ok = await run_schedule(it, first)
+            except Exception as e:
+                print("Lỗi chạy lịch:", e, flush=True)
+                ok = True
+
+            try:
+                if not ok:
+                    # ESP32 offline ở lần đầu: thử lại sau 1 phút
+                    it["tries"] = it.get("tries", 0) + 1
+                    if it["tries"] >= MAX_OFFLINE_TRIES:
+                        await asyncio.to_thread(sched_remove, [it["id"]])
+                        print("Bỏ lịch do ESP32 offline quá lâu:", it["id"], flush=True)
+                    else:
+                        it["at"] = (now + timedelta(seconds=OFFLINE_RETRY_S)).isoformat()
+                        await asyncio.to_thread(sched_update, it)
+                    continue
+
+                if first:
+                    # Đã nhắc lần đầu: đánh dấu chờ xác nhận, nhắc lại sau ACK_REPEAT_S
+                    it["fired"] = True
+                    it["tries"] = 0
+                    it["at"] = (now + timedelta(seconds=ACK_REPEAT_S)).isoformat()
+                    await asyncio.to_thread(sched_update, it)
                 else:
                     it["tries"] = it.get("tries", 0) + 1
-                    it["at"] = (now + timedelta(minutes=1)).isoformat()
-                    await asyncio.to_thread(sched_update, it)
-        except Exception as e:
-            print("Lỗi lịch:", e, flush=True)
+                    if it["tries"] >= MAX_ACK_REPEAT:
+                        await asyncio.to_thread(sched_remove, [it["id"]])
+                        await tg_text("Mình đã nhắc nhiều lần nhưng chưa thấy xác nhận, tạm dừng lịch này.")
+                    else:
+                        it["at"] = (now + timedelta(seconds=ACK_REPEAT_S)).isoformat()
+                        await asyncio.to_thread(sched_update, it)
+            except Exception as e:
+                print("Lỗi cập nhật lịch:", e, flush=True)
 
 
 @app.on_event("startup")
@@ -1044,11 +1216,20 @@ async def run_button(data: str):
                 on = (not cur) if val == "toggle" else (val == "on")
                 ok = await send_device(name, on)
                 if ok:
-                    STATE["devices"][name] = on     # cập nhật ngay, không chờ ESP32
+                    STATE["devices"][name] = on
                 text = f"Đã {'bật' if on else 'tắt'} {DEVICES[name]['label']}."
             await tg_text(text if ok else OFFLINE_MSG, MENU_KEYBOARD)
         return
-    if data == "start":
+    if data == "ack":
+        try:
+            n = await asyncio.to_thread(ack_all_pending)
+            text = ("Đã xóa lịch khỏi Upstash, lịch hẹn đã kết thúc." if n
+                    else "Hiện không có lịch nào đang chờ xác nhận.")
+        except Exception as e:
+            print("Lỗi xóa lịch khi đã nhớ:", e, flush=True)
+            text = f"Không xóa được lịch trên Upstash: {e}"
+        await tg_text(text, MENU_KEYBOARD)
+    elif data == "start":
         ok = await send_raw("CMD:START")
         await tg_text("Đã bật micro, bot đang nghe bạn." if ok else OFFLINE_MSG, MENU_KEYBOARD)
     elif data == "stop":
@@ -1109,22 +1290,54 @@ async def handle_telegram_update(update: dict):
     print("Nội dung Telegram:", text, flush=True)
     if not text:
         return
-    if text.lower() in ("/start", "/menu", "menu"):
+    low = text.lower()
+    if low in ("/start", "/menu", "menu"):
         await tg_text("Chọn thao tác cho bot:", MENU_KEYBOARD)
         return
-    if text.lower() == "/lichtest":
+    if low == "/lichtest":
         result = await asyncio.to_thread(schedule_selftest)
         await tg_text(result, MENU_KEYBOARD)
         return
-    if text.lower() == "/reotest":
+    if low == "/reotest":
         if DEVICE["ws"] is None:
             await tg_text("ESP32 chưa kết nối, không reo được.", MENU_KEYBOARD)
         else:
             await send_raw("CMD:ALARM")
             await tg_text("Đã gửi lệnh reo chuông tới loa.", MENU_KEYBOARD)
         return
+    if low == "/stopalarm":
+        ok = await send_raw("CMD:ALARM_STOP")
+        await tg_text("Đã tắt chuông." if ok else OFFLINE_MSG, MENU_KEYBOARD)
+        return
+    if low == "/nho":
+        try:
+            result = await asyncio.to_thread(tool_list_memory, {})
+        except Exception as e:
+            result = f"Không đọc được ghi nhớ: {e}"
+        await tg_text("Mình đang nhớ:\n" + result, MENU_KEYBOARD)
+        return
+    if low.startswith("/quen "):
+        try:
+            n = await asyncio.to_thread(mem_forget, text[6:])
+            result = f"Đã quên {n} điều liên quan." if n else "Không tìm thấy điều nào để quên."
+        except Exception as e:
+            result = f"Không xóa được: {e}"
+        await tg_text(result, MENU_KEYBOARD)
+        return
 
-    # Hiện tin nhắn Telegram lên trang web của thiết bị
+    # Đang có lịch chờ xác nhận và người dùng nhắn "đã nhớ": xóa lịch khỏi Upstash
+    if is_ack_text(text) and await asyncio.to_thread(has_pending):
+        try:
+            n = await asyncio.to_thread(ack_all_pending)
+            reply = "Ok, mình đã ghi nhận. Lịch hẹn đã xóa khỏi Upstash."
+        except Exception as e:
+            print("Lỗi xóa lịch khi đã nhớ (Telegram):", e, flush=True)
+            reply = f"Không xóa được lịch trên Upstash: {e}"
+        await tg_text(reply, MENU_KEYBOARD)
+        if DEVICE["ws"] is not None and not reply.startswith("Không"):
+            await speak_and_end(DEVICE["ws"], "Ok, mình đã ghi nhận.")
+        return
+
     if DEVICE["ws"] is not None:
         try:
             await DEVICE["ws"].send_text("USER:" + text)
@@ -1195,7 +1408,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 stop_music()
                 STATE["history"].clear()
                 STATE["recent"].clear()
-                print("Kết thúc hội thoại, xóa lịch sử", flush=True)
+                print("Kết thúc hội thoại, xóa lịch sử tạm (ghi nhớ vẫn giữ)", flush=True)
 
             elif text.startswith("SETVOL:"):
                 try:
