@@ -1,3 +1,4 @@
+import time
 import asyncio
 import io
 import json
@@ -31,7 +32,7 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
 HOME_LAT = float(os.environ.get("HOME_LAT", "0") or 0)
 HOME_LNG = float(os.environ.get("HOME_LNG", "0") or 0)
 HOME_RADIUS_M = float(os.environ.get("HOME_RADIUS_M", "500") or 500)
-WELCOME_MUSIC_URL = os.environ.get("WELCOME_MUSIC_URL", "")
+WELCOME_MUSIC_URL = os.environ.get("WELCOME_MUSIC_URL", "").strip()
 
 TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 SAMPLE_RATE = 16000
@@ -40,12 +41,21 @@ STT_MODEL = "whisper-large-v3"
 MAX_HISTORY = 10
 LEAVE_TIMEOUT_S = 300
 SCHEDULE_KEY = "xiaozhi:schedules"
+OFFLINE_MSG = "Thiết bị đang offline, kiểm tra ESP32 đã bật và có WiFi."
 
 TTS_VOICE = "vi-VN-HoaiMyNeural"
-TTS_CHUNK = 1024
+TTS_CHUNK = 4096                       # ~128 ms âm thanh mỗi gói
+SEND_AHEAD_S = 1.5                     # server gửi trước 1,5 giây để ESP32 có đệm
 TTS_PEAK = int(0.6 * 32767)
 MUSIC_PEAK = int(0.35 * 32767)
 DEFAULT_VOLUME = 70
+
+# Thiết bị điều khiển được, khớp với ESP32 (mỗi thiết bị một màu LED)
+DEVICES = {
+    "den":     {"label": "đèn",      "color": "đỏ"},
+    "maylanh": {"label": "máy lạnh", "color": "xanh lá"},
+    "tivi":    {"label": "tivi",     "color": "xanh dương"},
+}
 
 PREFERRED_LLM = [
     "openai/gpt-oss-120b",
@@ -62,13 +72,12 @@ ARCHIVE_SEARCH_URL = "https://archive.org/advancedsearch.php"
 ARCHIVE_MIN_BYTES = 1 * 1024 * 1024
 ARCHIVE_MAX_BYTES = 15 * 1024 * 1024
 
-# Trạng thái toàn hệ thống (một thiết bị)
 STATE = {
     "volume": DEFAULT_VOLUME,
     "recent": [],
     "history": [],
     "music_task": None,
-    "device_on": False,
+    "devices": {k: False for k in DEVICES},   # trạng thái thật do ESP32 báo lên
     "at_home": None,
     "leave_pending": False,
     "leave_task": None,
@@ -77,39 +86,80 @@ DEVICE = {"ws": None}
 SCHED_LOCK = threading.Lock()
 
 MENU_KEYBOARD = {"inline_keyboard": [
-    [{"text": "Bật thiết bị", "callback_data": "dev_on"},
-     {"text": "Tắt thiết bị", "callback_data": "dev_off"}],
+    [{"text": "Bật đèn", "callback_data": "dev:den:on"},
+     {"text": "Tắt đèn", "callback_data": "dev:den:off"}],
+    [{"text": "Bật máy lạnh", "callback_data": "dev:maylanh:on"},
+     {"text": "Tắt máy lạnh", "callback_data": "dev:maylanh:off"}],
+    [{"text": "Bật tivi", "callback_data": "dev:tivi:on"},
+     {"text": "Tắt tivi", "callback_data": "dev:tivi:off"}],
+    [{"text": "Tắt tất cả", "callback_data": "dev:ALL:off"}],
     [{"text": "Bật micro", "callback_data": "start"},
      {"text": "Dừng micro", "callback_data": "stop"}],
     [{"text": "Trạng thái", "callback_data": "status"},
      {"text": "Xem lịch", "callback_data": "list"}],
     [{"text": "Tạm biệt (chờ)", "callback_data": "bye"}],
 ]}
+
+
+def build_menu() -> dict:
+    d = STATE["devices"]
+
+    def lab(k, icon):
+        return f"{icon} {DEVICES[k]['label'].capitalize()}: {'BẬT' if d.get(k) else 'TẮT'}"
+
+    return {"inline_keyboard": [
+        [{"text": lab("den", "💡"), "callback_data": "dev:den:toggle"}],
+        [{"text": lab("maylanh", "❄️"), "callback_data": "dev:maylanh:toggle"}],
+        [{"text": lab("tivi", "📺"), "callback_data": "dev:tivi:toggle"}],
+        [{"text": "Tắt tất cả", "callback_data": "dev:ALL:off"},
+         {"text": "Trạng thái", "callback_data": "status"}],
+        [{"text": "Bật micro", "callback_data": "start"},
+         {"text": "Dừng micro", "callback_data": "stop"}],
+        [{"text": "Xem lịch", "callback_data": "list"},
+         {"text": "Tạm biệt", "callback_data": "bye"}],
+    ]}
+
+
 LEAVE_KEYBOARD = {"inline_keyboard": [
-    [{"text": "Tắt thiết bị", "callback_data": "leave_off"},
+    [{"text": "Tắt tất cả", "callback_data": "leave_off"},
      {"text": "Giữ bật", "callback_data": "leave_keep"}],
 ]}
 
-BASE_PROMPT = (
-    "Bạn là trợ lý giọng nói chạy trên thiết bị ESP32, người dùng nghe câu trả lời qua loa. "
-    "Luôn trả lời bằng tiếng Việt, tự nhiên, ngắn gọn, tối đa 3 câu. "
-    "Không dùng markdown, emoji, danh sách hay đường link. "
-    "Bạn có các công cụ: xem giờ, tìm kiếm web, xem thời tiết, chỉnh âm lượng, phát nhạc, "
-    "gửi tin nhắn Telegram, bật hoặc tắt thiết bị (đèn, quạt), đặt lịch hẹn, xem và hủy lịch, "
-    "và chuyển về chế độ chờ. "
-    "Khi người dùng nói bật hoặc tắt đèn, quạt hoặc thiết bị, gọi device_control. "
-    "Khi người dùng nói tạm biệt hoặc tắt bot, gọi shutdown_bot. "
-    "Khi người dùng đặt hẹn hoặc nhắc việc theo giờ, gọi add_schedule với when dạng HH:MM hoặc YYYY-MM-DD HH:MM theo giờ Việt Nam, "
-    "và xác nhận lại rõ thời gian. "
+DEVICE_RULES = (
+    "Thiết bị có thể điều khiển: đèn (đỏ), máy lạnh (xanh lá), tivi (xanh dương). "
+    "Khi người dùng nói bật hoặc tắt một thiết bị, gọi device_control với device và action. "
+    "Khi người dùng nói tắt tất cả, gọi device_control với device là tatca và action là off. "
+    "Khi người dùng đặt hẹn hoặc nhắc việc theo giờ, gọi add_schedule. "
     "Khi cần thông tin mới (thời tiết, tin tức, giá cả, sự kiện) hãy gọi công cụ trước khi trả lời. "
-    "Khi người dùng nhờ phát nhạc hoặc hát, gọi play_music. Bạn không tự hát được bài mới, chỉ phát được bản thu có sẵn. "
+    "Khi người dùng nhờ phát nhạc hoặc hát, gọi play_music. Bạn không tự hát được bài mới. "
+    "Khi người dùng nói tạm biệt hoặc tắt bot, gọi shutdown_bot. "
     "Bạn chưa có quyền truy cập lịch Google, email hay thiết bị khác; nếu được hỏi, hãy nói thật."
 )
 
+VOICE_PROMPT = (
+    "Bạn là trợ lý giọng nói chạy trên thiết bị ESP32, người dùng nghe câu trả lời qua loa. "
+    "Luôn trả lời bằng tiếng Việt, tự nhiên, ngắn gọn, tối đa 3 câu. "
+    "Không dùng markdown, emoji, danh sách hay đường link."
+)
 
-def system_prompt() -> str:
+TEXT_PROMPT = (
+    "Bạn là trợ lý nhà thông minh đang trò chuyện với chủ nhân qua Telegram, giống như một người bạn. "
+    "Trả lời tự nhiên, thân thiện, rõ ràng, có thể dài 2 đến 5 câu khi cần. "
+    "Không dùng markdown hay emoji. "
+    "Khi thực hiện một việc như bật tắt thiết bị, đặt lịch, phát nhạc hay tra cứu, hãy gọi công cụ rồi viết lại kết quả bằng câu tự nhiên. "
+    "Không chỉ sao chép thông báo của công cụ. "
+    "Khi đặt lịch, xác nhận đầy đủ: việc gì, lúc mấy giờ, ngày nào, và mã lịch. "
+    "Nếu thiếu thông tin như giờ hoặc thiết bị, hỏi lại một câu ngắn gọn."
+)
+
+
+def system_prompt(mode: str = "voice") -> str:
     now = datetime.now(TZ).strftime("%H:%M, ngày %d/%m/%Y")
-    return f"{BASE_PROMPT} Thời gian hiện tại ở Việt Nam: {now}."
+    base = TEXT_PROMPT if mode == "text" else VOICE_PROMPT
+    status = "Trạng thái thiết bị hiện tại: " + "; ".join(
+        f"{v['label']} {'đang bật' if STATE['devices'].get(k) else 'đang tắt'}"
+        for k, v in DEVICES.items())
+    return f"{base} {DEVICE_RULES} {status}. Thời gian hiện tại ở Việt Nam: {now}."
 
 
 def normalize(s: str) -> str:
@@ -175,6 +225,13 @@ def sched_add(item):
         save_schedules(items)
 
 
+def sched_update(item):
+    with SCHED_LOCK:
+        items = load_schedules()
+        items = [item if i["id"] == item["id"] else i for i in items]
+        save_schedules(items)
+
+
 def sched_remove(ids):
     with SCHED_LOCK:
         items = load_schedules()
@@ -206,6 +263,55 @@ def parse_when(s: str) -> datetime:
             t += timedelta(days=1)
         return t
     raise ValueError("Thời gian phải dạng HH:MM hoặc YYYY-MM-DD HH:MM")
+
+
+def schedule_selftest() -> str:
+    if not upstash_ready():
+        return (f"Thiếu biến Upstash: URL {'có' if UPSTASH_URL else 'THIẾU'}, "
+                f"TOKEN {'có' if UPSTASH_TOKEN else 'THIẾU'}")
+    try:
+        test_item = {"id": "test01", "at": "2099-01-01T00:00:00+07:00",
+                     "action": "remind", "note": "test"}
+        sched_add(test_item)
+        found = any(i.get("id") == "test01" for i in sched_read())
+        sched_remove(["test01"])
+        return ("Upstash hoạt động: ghi và đọc lịch OK" if found
+                else "Ghi được nhưng không đọc lại được lịch")
+    except Exception as e:
+        return f"Lỗi Upstash: {e}"
+
+
+# ---------- Điều khiển thiết bị ----------
+async def send_raw(text: str) -> bool:
+    ws = DEVICE["ws"]
+    if ws is None:
+        return False
+    try:
+        await ws.send_text(text)
+        return True
+    except Exception as e:
+        print("Lỗi gửi tới thiết bị:", e, flush=True)
+        return False
+
+
+async def send_device(name: str, on: bool) -> bool:
+    return await send_raw(f"DEV:{name}:{'ON' if on else 'OFF'}")
+
+
+async def send_all_off() -> bool:
+    return await send_raw("DEV:ALL:OFF")
+
+
+def any_device_on() -> bool:
+    return any(STATE["devices"].values())
+
+
+def devices_text() -> str:
+    lines = []
+    for k, info in DEVICES.items():
+        state = "BẬT" if STATE["devices"].get(k) else "TẮT"
+        lines.append(f"{info['label']} ({info['color']}): {state}")
+    return "\n".join(lines)
 
 
 # ---------- Công cụ ----------
@@ -285,14 +391,18 @@ def tool_send_telegram(ctx, message: str) -> str:
     return "Đã gửi tin nhắn Telegram" if data.get("ok") else "Gửi Telegram thất bại"
 
 
-def tool_device_control(ctx, action: str) -> str:
-    if action == "on":
-        ctx["device"] = "on"
-        return "Sẽ bật thiết bị"
-    if action == "off":
-        ctx["device"] = "off"
-        return "Sẽ tắt thiết bị"
-    return "Hành động không hợp lệ"
+def tool_device_control(ctx, device: str, action: str) -> str:
+    if action not in ("on", "off"):
+        return "Hành động không hợp lệ"
+    if device == "tatca":
+        if action != "off":
+            return "Chỉ có thể tắt tất cả"
+        ctx["devcmds"].append(("ALL", False))
+        return "Sẽ tắt tất cả thiết bị"
+    if device not in DEVICES:
+        return "Không có thiết bị này"
+    ctx["devcmds"].append((device, action == "on"))
+    return f"Sẽ {'bật' if action == 'on' else 'tắt'} {DEVICES[device]['label']}"
 
 
 def tool_shutdown_bot(ctx) -> str:
@@ -300,15 +410,28 @@ def tool_shutdown_bot(ctx) -> str:
     return "Sẽ chuyển về chế độ chờ sau lời tạm biệt"
 
 
-def tool_add_schedule(ctx, when: str, action: str, note: str = "") -> str:
+def tool_add_schedule(ctx, when: str, action: str, device: str = "", note: str = "") -> str:
     if action not in ("device_on", "device_off", "remind"):
         return "Hành động không hợp lệ"
-    t = parse_when(when)
+    if action != "remind" and device not in DEVICES:
+        return "Cần chọn thiết bị: đèn, máy lạnh hoặc tivi"
+    try:
+        t = parse_when(when)
+    except ValueError as e:
+        return str(e)
     if t <= datetime.now(TZ):
-        return "Thời gian này đã qua"
-    item = {"id": uuid.uuid4().hex[:6], "at": t.isoformat(), "action": action, "note": note[:200]}
-    sched_add(item)
-    label = {"device_on": "bật thiết bị", "device_off": "tắt thiết bị", "remind": "nhắc"}[action]
+        return "Thời gian này đã qua, hãy chọn giờ khác"
+    item = {"id": uuid.uuid4().hex[:6], "at": t.isoformat(), "action": action,
+            "device": device, "note": note[:200], "tries": 0}
+    try:
+        sched_add(item)
+    except Exception as e:
+        print("Lỗi ghi lịch:", e, flush=True)
+        return f"Không lưu được lịch: {e}"
+    if action == "remind":
+        label = "nhắc"
+    else:
+        label = ("bật " if action == "device_on" else "tắt ") + DEVICES[device]["label"]
     return f"Đã đặt lịch {label} lúc {t.strftime('%H giờ %M, ngày %d/%m/%Y')}, mã {item['id']}"
 
 
@@ -319,7 +442,12 @@ def tool_list_schedules(ctx) -> str:
     lines = []
     for it in sorted(items, key=lambda x: x["at"]):
         t = datetime.fromisoformat(it["at"]).astimezone(TZ)
-        lines.append(f"{it['id']}: {t.strftime('%H:%M %d/%m')} {it['action']} {it.get('note', '')}".strip())
+        if it["action"] == "remind":
+            what = f"nhắc: {it.get('note', '')}"
+        else:
+            name = DEVICES.get(it.get("device", ""), {}).get("label", "?")
+            what = ("bật " if it["action"] == "device_on" else "tắt ") + name
+        lines.append(f"{it['id']}: {t.strftime('%H:%M %d/%m')} {what}")
     return "; ".join(lines)
 
 
@@ -436,17 +564,20 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "message": {"type": "string"}}, "required": ["message"]}}},
     {"type": "function", "function": {"name": "device_control",
-        "description": "Bật hoặc tắt thiết bị điện (đèn, quạt) do ESP32 điều khiển",
+        "description": "Bật hoặc tắt đèn, máy lạnh, tivi. Dùng device tatca với action off để tắt tất cả.",
         "parameters": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["on", "off"]}}, "required": ["action"]}}},
+            "device": {"type": "string", "enum": ["den", "maylanh", "tivi", "tatca"]},
+            "action": {"type": "string", "enum": ["on", "off"]}},
+            "required": ["device", "action"]}}},
     {"type": "function", "function": {"name": "shutdown_bot",
         "description": "Chuyển bot về chế độ chờ khi người dùng nói tạm biệt hoặc tắt bot",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "add_schedule",
-        "description": "Đặt lịch bật/tắt thiết bị hoặc nhắc việc theo giờ",
+        "description": "Đặt lịch bật hoặc tắt một thiết bị, hoặc nhắc việc theo giờ",
         "parameters": {"type": "object", "properties": {
             "when": {"type": "string", "description": "HH:MM hoặc YYYY-MM-DD HH:MM, giờ Việt Nam"},
             "action": {"type": "string", "enum": ["device_on", "device_off", "remind"]},
+            "device": {"type": "string", "enum": ["den", "maylanh", "tivi"]},
             "note": {"type": "string", "description": "nội dung nhắc (nếu action là remind)"}},
             "required": ["when", "action"]}}},
     {"type": "function", "function": {"name": "list_schedules",
@@ -487,8 +618,8 @@ def llm_chat(messages: list, tools=None, max_tokens: int = 300):
     raise last_err
 
 
-def run_agent(history: list, user_text: str, ctx: dict) -> str:
-    messages = ([{"role": "system", "content": system_prompt()}]
+def run_agent(history: list, user_text: str, ctx: dict, mode: str = "voice") -> str:
+    messages = ([{"role": "system", "content": system_prompt(mode)}]
                 + history + [{"role": "user", "content": user_text}])
     for _ in range(4):
         msg = llm_chat(messages, TOOLS)
@@ -577,12 +708,16 @@ def download_track_pcm(url: str) -> bytes:
 
 
 async def send_audio(ws: WebSocket, pcm: bytes):
+    bytes_per_s = SAMPLE_RATE * 2
+    start = time.monotonic()
     sent = 0
     for i in range(0, len(pcm), TTS_CHUNK):
         chunk = pcm[i:i + TTS_CHUNK]
         await ws.send_bytes(chunk)
         sent += len(chunk)
-        await asyncio.sleep(len(chunk) / (SAMPLE_RATE * 2))
+        delay = (start + sent / bytes_per_s - SEND_AHEAD_S) - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
     print(f"Đã gửi xong audio: {sent}/{len(pcm)} bytes", flush=True)
 
 
@@ -606,6 +741,8 @@ def tg_api(method: str, payload: dict):
 
 
 async def tg_text(text: str, keyboard=None):
+    if keyboard is MENU_KEYBOARD:
+        keyboard = build_menu()          # menu luôn hiện trạng thái mới nhất
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]}
     if keyboard:
         payload["reply_markup"] = keyboard
@@ -614,21 +751,6 @@ async def tg_text(text: str, keyboard=None):
         print("Đã gửi Telegram, ok =", res.get("ok"), flush=True)
     except Exception as e:
         print("Lỗi gửi Telegram:", e, flush=True)
-
-
-async def send_device(cmd: str) -> bool:
-    ws = DEVICE["ws"]
-    if ws is None:
-        return False
-    try:
-        await ws.send_text(cmd)
-        return True
-    except Exception as e:
-        print("Lỗi gửi lệnh tới thiết bị:", e, flush=True)
-        return False
-
-
-OFFLINE_MSG = "Thiết bị đang offline, kiểm tra ESP32 đã bật và có WiFi."
 
 
 # ---------- Phát nhạc ----------
@@ -663,12 +785,13 @@ def start_music(ws: WebSocket, track: dict):
     STATE["music_task"] = asyncio.create_task(play_music(ws, track))
 
 
-# ---------- Trả lời chung cho giọng nói và Telegram ----------
+# ---------- Trả lời chung: giọng nói và Telegram ----------
 async def answer(user_text: str, voice: bool) -> bool:
-    ws = DEVICE["ws"]
-    ctx = {"volume": STATE["volume"], "music": None, "device": None, "standby": False}
+    """voice=True: trả lời bằng loa ESP32. voice=False: trả lời bằng chữ Telegram và đọc qua loa."""
+    mode = "voice" if voice else "text"
+    ctx = {"volume": STATE["volume"], "music": None, "devcmds": [], "standby": False}
     try:
-        reply = await asyncio.to_thread(run_agent, STATE["history"], user_text, ctx)
+        reply = await asyncio.to_thread(run_agent, STATE["history"], user_text, ctx, mode)
     except Exception as e:
         print("Lỗi AI:", e, flush=True)
         reply = f"Lỗi: {e}"
@@ -679,27 +802,31 @@ async def answer(user_text: str, voice: bool) -> bool:
 
     if ctx["volume"] != STATE["volume"]:
         STATE["volume"] = ctx["volume"]
-        if ws is not None:
-            try:
-                await ws.send_text(f"VOL:{STATE['volume']}")
-            except Exception:
-                pass
+        await send_raw(f"VOL:{STATE['volume']}")
 
-    if ctx["device"]:
-        ok = await send_device("CMD:DEV_ON" if ctx["device"] == "on" else "CMD:DEV_OFF")
-        if not ok:
-            reply = (reply + " " if reply else "") + OFFLINE_MSG
+    offline = False
+    for name, on in ctx["devcmds"]:
+        ok = await (send_all_off() if name == "ALL" else send_device(name, on))
+        offline = offline or not ok
+        if ok and name != "ALL":
+            STATE["devices"][name] = on
+        elif ok and name == "ALL":
+            for k in STATE["devices"]:
+                STATE["devices"][k] = False
+    if offline:
+        reply = (reply + " " if reply else "") + OFFLINE_MSG
 
     if ctx["music"] and not reply:
         reply = f"Đang phát {ctx['music']['title']}."
     if not reply:
-        reply = "Mình chưa có câu trả lời, bạn nói lại nhé."
+        reply = "Đã thực hiện yêu cầu." if ctx["devcmds"] else "Mình chưa có câu trả lời, bạn nói lại nhé."
 
     STATE["recent"] = (STATE["recent"] + [reply])[-3:]
     print("Trả lời:", reply, flush=True)
 
     music_started = False
     if voice:
+        ws = DEVICE["ws"]
         if ws is None:
             return False
         try:
@@ -711,9 +838,11 @@ async def answer(user_text: str, voice: bool) -> bool:
             print("Lỗi TTS:", e, flush=True)
     else:
         await tg_text(reply)
+        if DEVICE["ws"] is not None:
+            await speak_and_end(DEVICE["ws"], reply)
 
     if ctx["standby"]:
-        await send_device("CMD:STANDBY")
+        await send_raw("CMD:STANDBY")
 
     if ctx["music"]:
         if DEVICE["ws"] is not None:
@@ -769,26 +898,28 @@ async def welcome(ws: WebSocket):
 
 
 # ---------- Lịch hẹn ----------
-async def run_schedule(item: dict):
+async def run_schedule(item: dict) -> bool:
+    """Trả về False nếu thiết bị offline để lần sau thử lại."""
     action = item["action"]
-    note = item.get("note", "")
-    if action == "device_on":
-        ok = await send_device("CMD:DEV_ON")
-        msg = "Đã bật thiết bị theo lịch."
-    elif action == "device_off":
-        ok = await send_device("CMD:DEV_OFF")
-        msg = "Đã tắt thiết bị theo lịch."
+    if action in ("device_on", "device_off"):
+        name = item.get("device", "")
+        on = action == "device_on"
+        label = DEVICES.get(name, {}).get("label", name)
+        ok = await send_device(name, on)
+        if not ok:
+            return False
+        STATE["devices"][name] = on
+        msg = f"Đã {'bật' if on else 'tắt'} {label} theo lịch."
     else:
-        ok = True
-        msg = f"Nhắc bạn: {note}"
-    if not ok and action != "remind":
-        msg += " Nhưng thiết bị đang offline."
+        msg = f"Nhắc bạn: {item.get('note', '')}"
     await tg_text(msg)
     if DEVICE["ws"] is not None:
         await speak_and_end(DEVICE["ws"], msg)
+    return True
 
 
 async def scheduler_loop():
+    print("Bộ hẹn giờ đã khởi động", flush=True)
     while True:
         await asyncio.sleep(20)
         if not upstash_ready():
@@ -797,10 +928,15 @@ async def scheduler_loop():
             items = await asyncio.to_thread(sched_read)
             now = datetime.now(TZ)
             due = [i for i in items if datetime.fromisoformat(i["at"]) <= now]
-            if due:
-                await asyncio.to_thread(sched_remove, [d["id"] for d in due])
-                for it in due:
-                    await run_schedule(it)
+            for it in due:
+                print("Đến giờ lịch:", it["id"], it["action"], it.get("device", ""), flush=True)
+                ok = await run_schedule(it)
+                if ok or it.get("tries", 0) >= 30:
+                    await asyncio.to_thread(sched_remove, [it["id"]])
+                else:
+                    it["tries"] = it.get("tries", 0) + 1
+                    it["at"] = (now + timedelta(minutes=1)).isoformat()
+                    await asyncio.to_thread(sched_update, it)
         except Exception as e:
             print("Lỗi lịch:", e, flush=True)
 
@@ -826,9 +962,11 @@ async def leave_timeout():
         return
     if STATE["leave_pending"]:
         STATE["leave_pending"] = False
-        ok = await send_device("CMD:DEV_OFF")
+        ok = await send_all_off()
         if ok:
-            await tg_text("Hết 5 phút không có phản hồi, mình đã tự tắt thiết bị để an toàn.")
+            for k in STATE["devices"]:
+                STATE["devices"][k] = False
+            await tg_text("Hết 5 phút không có phản hồi, mình đã tắt các thiết bị để an toàn.")
         else:
             await tg_text("Hết 5 phút, nhưng thiết bị đang offline nên chưa tắt được.")
 
@@ -855,38 +993,50 @@ async def on_location(lat: float, lng: float):
             await tg_text("Chào mừng bạn về nhà.")
         return
 
-    if prev is True and STATE["device_on"] and not STATE["leave_pending"]:
+    if prev is True and any_device_on() and not STATE["leave_pending"]:
         STATE["leave_pending"] = True
         STATE["leave_task"] = asyncio.create_task(leave_timeout())
         await tg_text(
-            f"Bạn đã ra khỏi nhà (cách khoảng {int(d)} m). Thiết bị đang bật. "
-            "Bạn có muốn tắt không? Nếu không trả lời trong 5 phút, mình sẽ tự tắt.",
+            f"Bạn đã ra khỏi nhà (cách khoảng {int(d)} m). Đang có thiết bị bật:\n"
+            f"{devices_text()}\nBạn có muốn tắt tất cả không? Nếu không trả lời trong 5 phút, mình sẽ tự tắt.",
             LEAVE_KEYBOARD)
 
 
 # ---------- Xử lý cập nhật từ Telegram ----------
 def status_text() -> str:
     online = "online" if DEVICE["ws"] is not None else "offline"
-    dev = "bật" if STATE["device_on"] else "tắt"
     if STATE["at_home"] is None:
         place = "chưa rõ"
     else:
         place = "ở nhà" if STATE["at_home"] else "ngoài nhà"
-    return f"Thiết bị: {online}\nĐèn/quạt: {dev}\nVị trí: {place}"
+    return f"Thiết bị ESP32: {online}\n{devices_text()}\nVị trí: {place}"
 
 
 async def run_button(data: str):
-    if data == "dev_on":
-        ok = await send_device("CMD:DEV_ON")
-        await tg_text("Đã bật thiết bị." if ok else OFFLINE_MSG, MENU_KEYBOARD)
-    elif data == "dev_off":
-        ok = await send_device("CMD:DEV_OFF")
-        await tg_text("Đã tắt thiết bị." if ok else OFFLINE_MSG, MENU_KEYBOARD)
-    elif data == "start":
-        ok = await send_device("CMD:START")
+    if data.startswith("dev:"):
+        parts = data.split(":")
+        if len(parts) == 3:
+            _, name, val = parts
+            if name == "ALL":
+                ok = await send_all_off()
+                if ok:
+                    for k in STATE["devices"]:
+                        STATE["devices"][k] = False
+                text = "Đã tắt tất cả thiết bị."
+            else:
+                cur = STATE["devices"].get(name, False)
+                on = (not cur) if val == "toggle" else (val == "on")
+                ok = await send_device(name, on)
+                if ok:
+                    STATE["devices"][name] = on     # cập nhật ngay, không chờ ESP32
+                text = f"Đã {'bật' if on else 'tắt'} {DEVICES[name]['label']}."
+            await tg_text(text if ok else OFFLINE_MSG, MENU_KEYBOARD)
+        return
+    if data == "start":
+        ok = await send_raw("CMD:START")
         await tg_text("Đã bật micro, bot đang nghe bạn." if ok else OFFLINE_MSG, MENU_KEYBOARD)
     elif data == "stop":
-        ok = await send_device("CMD:STOP")
+        ok = await send_raw("CMD:STOP")
         await tg_text("Đã dừng micro." if ok else OFFLINE_MSG, MENU_KEYBOARD)
     elif data == "status":
         await tg_text(status_text(), MENU_KEYBOARD)
@@ -899,26 +1049,26 @@ async def run_button(data: str):
         ws = DEVICE["ws"]
         if ws is not None:
             await speak_and_end(ws, "Tạm biệt chủ nhân.")
-            await send_device("CMD:STANDBY")
+            await send_raw("CMD:STANDBY")
             await tg_text("Thiết bị đã chuyển về chế độ chờ.", MENU_KEYBOARD)
         else:
             await tg_text(OFFLINE_MSG, MENU_KEYBOARD)
     elif data == "leave_off":
         cancel_leave()
-        ok = await send_device("CMD:DEV_OFF")
-        await tg_text("Đã tắt thiết bị." if ok else OFFLINE_MSG)
+        ok = await send_all_off()
+        if ok:
+            for k in STATE["devices"]:
+                STATE["devices"][k] = False
+        await tg_text("Đã tắt tất cả thiết bị." if ok else OFFLINE_MSG)
     elif data == "leave_keep":
         cancel_leave()
         await tg_text("Đã giữ thiết bị bật.")
 
 
 async def handle_telegram_update(update: dict):
-    print("Nhận update Telegram, keys:", list(update.keys()), flush=True)
-
     if "callback_query" in update:
         cq = update["callback_query"]
         chat = str(cq.get("message", {}).get("chat", {}).get("id", ""))
-        print(f"Callback từ chat {chat}, cấu hình {TELEGRAM_CHAT_ID}", flush=True)
         if chat != TELEGRAM_CHAT_ID:
             print("Bỏ qua callback: chat ID không khớp", flush=True)
             return
@@ -928,13 +1078,10 @@ async def handle_telegram_update(update: dict):
 
     msg = update.get("message") or update.get("edited_message")
     if not msg:
-        print("Update không có message, bỏ qua", flush=True)
         return
-
     chat_id = str(msg.get("chat", {}).get("id", ""))
-    print(f"Tin từ chat {chat_id}, cấu hình {TELEGRAM_CHAT_ID}", flush=True)
     if chat_id != TELEGRAM_CHAT_ID:
-        print("Bỏ qua tin: chat ID không khớp", flush=True)
+        print(f"Bỏ qua tin: chat {chat_id} không khớp cấu hình", flush=True)
         return
 
     loc = msg.get("location")
@@ -943,12 +1090,23 @@ async def handle_telegram_update(update: dict):
         return
 
     text = (msg.get("text") or "").strip()
-    print("Nội dung:", text, flush=True)
+    print("Nội dung Telegram:", text, flush=True)
     if not text:
         return
     if text.lower() in ("/start", "/menu", "menu"):
         await tg_text("Chọn thao tác cho bot:", MENU_KEYBOARD)
         return
+    if text.lower() == "/lichtest":
+        result = await asyncio.to_thread(schedule_selftest)
+        await tg_text(result, MENU_KEYBOARD)
+        return
+
+    # Hiện tin nhắn Telegram lên trang web của thiết bị
+    if DEVICE["ws"] is not None:
+        try:
+            await DEVICE["ws"].send_text("USER:" + text)
+        except Exception:
+            pass
     await answer(text, voice=False)
 
 
@@ -1023,7 +1181,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     pass
 
             elif text.startswith("STATE:"):
-                STATE["device_on"] = (text == "STATE:ON")
+                parts = text.split(":")
+                if len(parts) == 3 and parts[1] in DEVICES:
+                    STATE["devices"][parts[1]] = (parts[2] == "ON")
 
             elif text == "HELLO":
                 asyncio.create_task(welcome(websocket))
@@ -1043,4 +1203,4 @@ async def websocket_endpoint(websocket: WebSocket):
         if DEVICE["ws"] is websocket:
             DEVICE["ws"] = None
 
-    print("ESP32 ngắt kết nối", flush=True)
+    print("ESP32 đã kết nối", flush=True)
