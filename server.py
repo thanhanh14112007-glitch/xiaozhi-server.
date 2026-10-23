@@ -43,6 +43,8 @@ LEAVE_TIMEOUT_S = 300
 SCHEDULE_KEY = "xiaozhi:schedules"
 OFFLINE_MSG = "Thiết bị đang offline, kiểm tra ESP32 đã bật và có WiFi."
 
+ALARM_SECONDS = 5.0                    # thời lượng chuông reo trên loa (phải khớp với ESP32)
+
 TTS_VOICE = "vi-VN-HoaiMyNeural"
 TTS_CHUNK = 4096                       # ~128 ms âm thanh mỗi gói
 SEND_AHEAD_S = 1.5                     # server gửi trước 1,5 giây để ESP32 có đệm
@@ -85,21 +87,6 @@ STATE = {
 DEVICE = {"ws": None}
 SCHED_LOCK = threading.Lock()
 
-MENU_KEYBOARD = {"inline_keyboard": [
-    [{"text": "Bật đèn", "callback_data": "dev:den:on"},
-     {"text": "Tắt đèn", "callback_data": "dev:den:off"}],
-    [{"text": "Bật máy lạnh", "callback_data": "dev:maylanh:on"},
-     {"text": "Tắt máy lạnh", "callback_data": "dev:maylanh:off"}],
-    [{"text": "Bật tivi", "callback_data": "dev:tivi:on"},
-     {"text": "Tắt tivi", "callback_data": "dev:tivi:off"}],
-    [{"text": "Tắt tất cả", "callback_data": "dev:ALL:off"}],
-    [{"text": "Bật micro", "callback_data": "start"},
-     {"text": "Dừng micro", "callback_data": "stop"}],
-    [{"text": "Trạng thái", "callback_data": "status"},
-     {"text": "Xem lịch", "callback_data": "list"}],
-    [{"text": "Tạm biệt (chờ)", "callback_data": "bye"}],
-]}
-
 
 def build_menu() -> dict:
     d = STATE["devices"]
@@ -119,6 +106,10 @@ def build_menu() -> dict:
          {"text": "Tạm biệt", "callback_data": "bye"}],
     ]}
 
+
+MENU_KEYBOARD = {"inline_keyboard": [
+    [{"text": "Bật đèn", "callback_data": "dev:den:on"}],
+]}  # đánh dấu để tg_text biết cần dựng menu mới
 
 LEAVE_KEYBOARD = {"inline_keyboard": [
     [{"text": "Tắt tất cả", "callback_data": "leave_off"},
@@ -573,12 +564,12 @@ TOOLS = [
         "description": "Chuyển bot về chế độ chờ khi người dùng nói tạm biệt hoặc tắt bot",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "add_schedule",
-        "description": "Đặt lịch bật hoặc tắt một thiết bị, hoặc nhắc việc theo giờ",
+        "description": "Đặt lịch bật hoặc tắt một thiết bị, hoặc nhắc việc theo giờ. Với remind, note là nội dung cần nhắc, ví dụ 'đi giặt đồ'.",
         "parameters": {"type": "object", "properties": {
             "when": {"type": "string", "description": "HH:MM hoặc YYYY-MM-DD HH:MM, giờ Việt Nam"},
             "action": {"type": "string", "enum": ["device_on", "device_off", "remind"]},
             "device": {"type": "string", "enum": ["den", "maylanh", "tivi"]},
-            "note": {"type": "string", "description": "nội dung nhắc (nếu action là remind)"}},
+            "note": {"type": "string", "description": "nội dung cần nhắc (chỉ dùng khi action là remind)"}},
             "required": ["when", "action"]}}},
     {"type": "function", "function": {"name": "list_schedules",
         "description": "Xem danh sách lịch đã đặt",
@@ -898,21 +889,46 @@ async def welcome(ws: WebSocket):
 
 
 # ---------- Lịch hẹn ----------
+async def ring_alarm() -> bool:
+    """Gửi lệnh reo chuông tới ESP32 và đợi chuông reo xong. Trả về False nếu offline."""
+    if DEVICE["ws"] is None:
+        return False
+    await send_raw("CMD:ALARM")
+    await asyncio.sleep(ALARM_SECONDS + 0.5)
+    return True
+
+
 async def run_schedule(item: dict) -> bool:
-    """Trả về False nếu thiết bị offline để lần sau thử lại."""
+    """
+    Trả về True nếu đã xử lý xong lịch (kể cả khi loa offline, Telegram vẫn nhận tin).
+    Trả về False chỉ với lịch điều khiển thiết bị khi ESP32 offline, để thử lại sau.
+    """
     action = item["action"]
+
     if action in ("device_on", "device_off"):
         name = item.get("device", "")
         on = action == "device_on"
         label = DEVICES.get(name, {}).get("label", name)
+        if DEVICE["ws"] is None:
+            return False                       # thiết bị offline: thử lại sau
+        await ring_alarm()
         ok = await send_device(name, on)
-        if not ok:
-            return False
-        STATE["devices"][name] = on
-        msg = f"Đã {'bật' if on else 'tắt'} {label} theo lịch."
+        if ok:
+            STATE["devices"][name] = on
+        verb = "bật" if on else "tắt"
+        msg = (f"Đã {verb} {label} theo lịch." if ok
+               else f"Không {verb} được {label} vì thiết bị offline.")
+
     else:
-        msg = f"Nhắc bạn: {item.get('note', '')}"
-    await tg_text(msg)
+        note = (item.get("note") or "").strip()
+        msg = f"Đến giờ rồi, bạn nhớ: {note}" if note else "Đến giờ rồi."
+        if DEVICE["ws"] is not None:
+            await ring_alarm()
+
+    # Luôn nhắn Telegram để điện thoại có thông báo, dù loa có online hay không
+    await tg_text("🔔 " + msg)
+
+    # Nếu loa online thì đọc nội dung sau khi chuông reo
     if DEVICE["ws"] is not None:
         await speak_and_end(DEVICE["ws"], msg)
     return True
@@ -1100,6 +1116,13 @@ async def handle_telegram_update(update: dict):
         result = await asyncio.to_thread(schedule_selftest)
         await tg_text(result, MENU_KEYBOARD)
         return
+    if text.lower() == "/reotest":
+        if DEVICE["ws"] is None:
+            await tg_text("ESP32 chưa kết nối, không reo được.", MENU_KEYBOARD)
+        else:
+            await send_raw("CMD:ALARM")
+            await tg_text("Đã gửi lệnh reo chuông tới loa.", MENU_KEYBOARD)
+        return
 
     # Hiện tin nhắn Telegram lên trang web của thiết bị
     if DEVICE["ws"] is not None:
@@ -1203,4 +1226,4 @@ async def websocket_endpoint(websocket: WebSocket):
         if DEVICE["ws"] is websocket:
             DEVICE["ws"] = None
 
-    print("ESP32 đã kết nối", flush=True)
+    print("ESP32 ngắt kết nối", flush=True)
