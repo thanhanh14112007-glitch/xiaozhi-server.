@@ -50,6 +50,7 @@ ACK_REPEAT_S = 120                     # nhắc lại mỗi 2 phút nếu chưa 
 MAX_ACK_REPEAT = 15                    # nhắc tối đa 15 lần rồi tạm dừng lịch
 OFFLINE_RETRY_S = 60                   # lịch điều khiển khi ESP32 offline: thử lại mỗi phút
 MAX_OFFLINE_TRIES = 30
+LISTEN_AFTER_REMIND_S = 4.0            # chờ loa đọc xong rồi mới mở micro để nghe "đã nhớ"
 
 TTS_VOICE = "vi-VN-HoaiMyNeural"
 TTS_CHUNK = 4096
@@ -387,6 +388,26 @@ def devices_text() -> str:
         state = "BẬT" if STATE["devices"].get(k) else "TẮT"
         lines.append(f"{info['label']} ({info['color']}): {state}")
     return "\n".join(lines)
+
+
+async def confirm_done() -> str:
+    """Đã nhớ: dừng chuông trên loa rồi xóa lịch đã nhắc khỏi Upstash.
+    Trả về thông báo để đọc/hiển thị."""
+    await send_raw("CMD:ALARM_STOP")
+    try:
+        n = await asyncio.to_thread(ack_all_pending)
+    except Exception as e:
+        print("Lỗi xóa lịch khi đã nhớ:", e, flush=True)
+        return f"Không xóa được lịch trên Upstash: {e}"
+    return ("Ok, mình đã ghi nhận. Lịch hẹn đã xóa khỏi Upstash." if n
+            else "Hiện không có lịch nào đang chờ xác nhận.")
+
+
+async def open_mic_later(delay: float):
+    """Sau khi loa đọc xong lời nhắc, mở micro để nghe câu 'đã nhớ'."""
+    await asyncio.sleep(delay)
+    if DEVICE["ws"] is not None:
+        await send_raw("CMD:START")
 
 
 # ---------- Công cụ ----------
@@ -1000,14 +1021,9 @@ async def handle_turn(ws: WebSocket, pcm: bytes):
             return
         await ws.send_text("USER:" + user_text)
 
-        # Đang có lịch chờ xác nhận và người dùng nói "đã nhớ": xóa lịch khỏi Upstash
+        # Đang có lời nhắc chờ xác nhận và người dùng nói "đã nhớ"
         if is_ack_text(user_text) and await asyncio.to_thread(has_pending):
-            try:
-                n = await asyncio.to_thread(ack_all_pending)
-                reply = "Ok, mình đã ghi nhận. Lịch hẹn đã kết thúc."
-            except Exception as e:
-                print("Lỗi xóa lịch khi đã nhớ (giọng nói):", e, flush=True)
-                reply = "Mình chưa xóa được lịch, bạn thử lại nhé."
+            reply = await confirm_done()
             await speak_and_end(ws, reply)
             ended = True
             return
@@ -1034,8 +1050,8 @@ async def ring_alarm() -> bool:
 
 async def run_schedule(item: dict, first: bool) -> bool:
     """
-    Trả về False chỉ khi lần đầu chạy lịch điều khiển thiết bị mà ESP32 offline (để thử lại).
-    Các lần nhắc lại luôn coi là thành công.
+    False chỉ khi lần đầu chạy lịch điều khiển thiết bị mà ESP32 offline (để thử lại).
+    Chuông chỉ reo ở lần đầu. Các lần nhắc lại chỉ đọc lời nhắc.
     """
     action = item["action"]
     note = (item.get("note") or "").strip()
@@ -1047,8 +1063,8 @@ async def run_schedule(item: dict, first: bool) -> bool:
         verb = "bật" if on else "tắt"
         if first and DEVICE["ws"] is None:
             return False
-        await ring_alarm()
         if first:
+            await ring_alarm()
             ok = await send_device(name, on)
             if ok:
                 STATE["devices"][name] = on
@@ -1057,13 +1073,18 @@ async def run_schedule(item: dict, first: bool) -> bool:
         else:
             base = f"Nhắc lại: lịch {verb} {label} đã thực hiện."
     else:
-        base = f"Đến giờ rồi, bạn nhớ: {note}" if first else f"Nhắc lại: bạn nhớ {note}"
-        await ring_alarm()
+        if first:
+            base = f"Đến giờ rồi, bạn nhớ: {note}" if note else "Đến giờ rồi."
+            await ring_alarm()
+        else:
+            base = f"Nhắc lại: bạn nhớ {note}" if note else "Nhắc lại việc đã hẹn."
 
     text = base + " Bạn đã nhớ chưa? Nói đã nhớ hoặc bấm nút để kết thúc."
     await tg_text("🔔 " + text, ACK_KEYBOARD)
     if DEVICE["ws"] is not None:
         await speak_and_end(DEVICE["ws"], text)
+        # Mở micro sau khi loa đọc xong để nghe câu "đã nhớ"
+        asyncio.create_task(open_mic_later(LISTEN_AFTER_REMIND_S))
     return True
 
 
@@ -1092,7 +1113,6 @@ async def scheduler_loop():
 
             try:
                 if not ok:
-                    # ESP32 offline ở lần đầu: thử lại sau 1 phút
                     it["tries"] = it.get("tries", 0) + 1
                     if it["tries"] >= MAX_OFFLINE_TRIES:
                         await asyncio.to_thread(sched_remove, [it["id"]])
@@ -1103,7 +1123,6 @@ async def scheduler_loop():
                     continue
 
                 if first:
-                    # Đã nhắc lần đầu: đánh dấu chờ xác nhận, nhắc lại sau ACK_REPEAT_S
                     it["fired"] = True
                     it["tries"] = 0
                     it["at"] = (now + timedelta(seconds=ACK_REPEAT_S)).isoformat()
@@ -1212,14 +1231,10 @@ async def run_button(data: str):
             await tg_text(text if ok else OFFLINE_MSG, MENU_KEYBOARD)
         return
     if data == "ack":
-        try:
-            n = await asyncio.to_thread(ack_all_pending)
-            text = ("Đã xóa lịch khỏi Upstash, lịch hẹn đã kết thúc." if n
-                    else "Hiện không có lịch nào đang chờ xác nhận.")
-        except Exception as e:
-            print("Lỗi xóa lịch khi đã nhớ:", e, flush=True)
-            text = f"Không xóa được lịch trên Upstash: {e}"
+        text = await confirm_done()
         await tg_text(text, MENU_KEYBOARD)
+        if DEVICE["ws"] is not None and text.startswith("Ok"):
+            await speak_and_end(DEVICE["ws"], "Ok, mình đã ghi nhận.")
     elif data == "start":
         ok = await send_raw("CMD:START")
         await tg_text("Đã bật micro, bot đang nghe bạn." if ok else OFFLINE_MSG, MENU_KEYBOARD)
@@ -1316,16 +1331,11 @@ async def handle_telegram_update(update: dict):
         await tg_text(result, MENU_KEYBOARD)
         return
 
-    # Đang có lịch chờ xác nhận và người dùng nhắn "đã nhớ": xóa lịch khỏi Upstash
+    # Đang có lời nhắc chờ xác nhận và người dùng nhắn "đã nhớ"
     if is_ack_text(text) and await asyncio.to_thread(has_pending):
-        try:
-            n = await asyncio.to_thread(ack_all_pending)
-            reply = "Ok, mình đã ghi nhận. Lịch hẹn đã xóa khỏi Upstash."
-        except Exception as e:
-            print("Lỗi xóa lịch khi đã nhớ (Telegram):", e, flush=True)
-            reply = f"Không xóa được lịch trên Upstash: {e}"
+        reply = await confirm_done()
         await tg_text(reply, MENU_KEYBOARD)
-        if DEVICE["ws"] is not None and not reply.startswith("Không"):
+        if DEVICE["ws"] is not None and reply.startswith("Ok"):
             await speak_and_end(DEVICE["ws"], "Ok, mình đã ghi nhận.")
         return
 
@@ -1413,7 +1423,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     STATE["devices"][parts[1]] = (parts[2] == "ON")
 
             elif text == "HELLO":
-                # Đã loại bỏ hàm welcome() cũ gây lỗi URL, giờ chỉ gửi lời chào cơ bản gọn gàng
+                print("ESP32 chào: phát lời chào", flush=True)
                 asyncio.create_task(speak_and_end(websocket, "Kính chào chủ nhân."))
 
             elif text == "STOP_RECORDING":
