@@ -36,7 +36,7 @@ HOME_RADIUS_M = float(os.environ.get("HOME_RADIUS_M", "500") or 500)
 TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 SAMPLE_RATE = 16000
 MIN_BYTES = SAMPLE_RATE * 2 // 2
-STT_MODEL = "whisper-large-v3"
+STT_MODEL = "Whire esp32 rtitpe 
 MAX_HISTORY = 10
 LEAVE_TIMEOUT_S = 300
 SCHEDULE_KEY = "xiaozhi:schedules"
@@ -149,7 +149,7 @@ VOICE_PROMPT = (
 )
 
 TEXT_PROMPT = (
-    "Bạn là trợ lý nhà thông minh đang trò chuyện với chủ nhân qua Telegram, giống như một người bạn. "
+    "Bạn là một trọ lý AI của tôi và trợ lý của tôi trong ngôi nhà của tôi đẻ tôi có thể điều khiểu bạn từ xa nâng cao tầm sử dụng của bạn để nâng cao tầm quan trọng của công nghệ đói với tôi   "
     "Trả lời tự nhiên, thân thiện, rõ ràng, có thể dài 2 đến 5 câu khi cần. "
     "Không dùng markdown hay emoji. "
     "Khi thực hiện một việc như bật tắt thiết bị, đặt lịch, phát nhạc hay tra cứu, hãy gọi công cụ rồi viết lại kết quả bằng câu tự nhiên. "
